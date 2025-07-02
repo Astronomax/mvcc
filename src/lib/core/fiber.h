@@ -322,6 +322,8 @@ struct fiber_attr {
 void
 fiber_attr_create(struct fiber_attr *fiber_attr);
 
+struct txn;
+
 struct fiber {
 	coro_context ctx;
 	/** Coro stack slab. */
@@ -388,6 +390,7 @@ struct fiber {
 		void *f_arg;
 	};
 	int f_ret;
+	struct txn *txn;
 };
 
 /**

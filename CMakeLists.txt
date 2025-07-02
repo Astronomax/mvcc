@@ -135,7 +135,15 @@ configure_file(
 add_subdirectory(src)
 
 set (sources
+    src/box.c
+    src/index.cc
+    src/key_def.cc
     src/main.cc
+    src/memtx_engine.c
+    src/memtx_space.c
+    src/memtx_tx.c
+    src/tuple.cc
+    src/txn.c
 )
 
 add_executable(memtx_tx ${sources})
