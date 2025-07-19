@@ -1404,6 +1404,64 @@ memtx_tx_abort_story_readers(struct memtx_story *story)
 }
 
 /*
+ * After the last prepared story in a chain is modified (either when another
+ * story becomes last or when the del_psn of the last story becomes 0), some
+ * subsequent transactions may become duplicates. This function aborts all
+ * in-progress transactions that would lead to duplicates.
+ */
+static void
+memtx_tx_handle_dups_in_secondary_indexes(struct memtx_story *story)
+{
+	if (story == NULL)
+		return;
+
+	struct txn_stmt *stmt = story->add_stmt;
+	/* Обработка конфликтов во вторичных индексах. */
+	for (uint32_t i = 1; i < story->index_count; i++) {
+		/*
+		 * Обработка вторичных cross-write конфликтов. Этот случай
+		 * слишком сложен и заслуживает пояснения на примере.
+		 * Представим спейс с первичным ключом (pk) по первому полю
+		 * и вторичным индексом (sk) по второму полю.
+		 * Представим себе 3 in-progress транзакции, которые выполняют
+		 * реплейсы {1, 1, 1}, {2, 1, 2} и {1, 1, 3} соответственно.
+		 * Что должно произойти, когда первая транзакция коммитится?
+		 * Обе другие транзакции пересекаются с текущей во вторичном ключе.
+		 * Но вторая транзакция с {2, 1, 2} должна быть зааборчена
+		 * (или отправлена в read view) из-за конфликта: она вводит
+		 * дубликат по вторичному ключу.
+		 * С другой стороны третья транзакция с таплом {1, 1, 3} имеет
+		 * право на существование, т.к. перезаписывает {1, 1, 1}
+		 * в обоих - вторичном и первичном индексах.
+		 * Чтобы обработать эти конфликты, мы должны просканировать
+		 * цепочки в направлении верхушки и проверить все insert стейтменты.
+		 */
+		struct memtx_story *newer_story = story;
+		while (newer_story->link[i].newer_story != NULL) {
+			newer_story = newer_story->link[i].newer_story;
+			struct txn_stmt *test_stmt = newer_story->add_stmt;
+			/* Не конфликтуем с собственными изменениями. */
+			if (stmt != NULL && test_stmt->txn == stmt->txn)
+				continue;
+			assert(test_stmt->txn->psn == 0);
+			/* Вставка после удаления этой же транзакцией. */
+			if (test_stmt->is_own_change &&
+			    test_stmt->del_story == NULL)
+				continue;
+			/*
+			 * По вторичному индексу транзакция перезаписала нашу story,
+			 * которую мы сейчас препейрим, но удалила другую. Пока не
+			 * понятно, почему мы не отправили сразу в read view. Видимо,
+			 * эта ситуация может меняться со временем.
+			 */
+			if (test_stmt->del_story == story)
+				continue;
+			txn_abort_with_conflict(test_stmt->txn);
+		}
+	}
+}
+
+/*
  * Откатываем добавление story данным стейтментом.
  */
 static void
@@ -1413,9 +1471,25 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 	struct memtx_story *del_story = stmt->del_story;
 
 	/*
-	 * В случае отката подготовленного оператора нам необходимо откатить
-	 * preparation actions и прервать другие транзакции, которым удалось
-	 * прочитать это подготовленное состояние..
+	 * Перенести историю в конец цепочки и отметить ее как удаленную давно
+	 * (с очень низким del_psn). После этого история станет невидимой для
+	 * любого читателя (это именно то, чего бы мы хотели) и все еще сможет
+	 * хранить read set, если это необходимо.
+	 */
+	for (uint32_t i = 0; i < add_story->index_count; ) {
+		struct memtx_story *old_story = add_story->link[i].older_story;
+		if (old_story == NULL) {
+			/* Old story is absent. */
+			i++; /* Go to the next index. */
+			continue;
+		}
+		memtx_tx_story_reorder(add_story, old_story, i);
+	}
+
+	/*
+	 * В случае отката prepared стейтмента нам необходимо откатить
+	 * preparation actions и откатить другие транзакции, которым удалось
+	 * прочитать это prepared состояние.
 	 */
 	if (stmt->txn->psn != 0) { // prepared.
 		/*
@@ -1440,7 +1514,7 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 			assert(!test_stmt->is_own_change);
 			assert(test_stmt->txn->psn == 0);
 
-			/* Отсоединяем от add_story списка. */
+			/* Отсоединяем от add_story's списка. */
 			*from = test_stmt->next_in_del_list;
 			test_stmt->next_in_del_list = NULL;
 			test_stmt->del_story = NULL;
@@ -1450,6 +1524,8 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 				memtx_tx_story_link_deleted_by(del_story, test_stmt);
 			}
 		}
+
+		memtx_tx_handle_dups_in_secondary_indexes(del_story);
 
 		/* Откатываем присвоение psn. */
 		add_story->add_psn = 0;
@@ -1466,21 +1542,6 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 		/* Если что-то удалили - тоже. */
 		memtx_tx_story_unlink_deleted_by(del_story, stmt);
 
-	/*
-	 * Перенести историю в конец цепочки и отметить ее как удаленную давно
-	 * (с очень низким del_psn). После этого история станет невидимой для
-	 * любого читателя (это именно то, чего бы мы хотели) и все еще сможет
-	 * хранить read set, если это необходимо.
-	 */
-	for (uint32_t i = 0; i < add_story->index_count; ) {
-		struct memtx_story *old_story = add_story->link[i].older_story;
-		if (old_story == NULL) {
-			/* Эта story теперь самая первая, переходим на следующий индекс. */
-			i++;
-			continue;
-		}
-		memtx_tx_story_reorder(add_story, old_story, i);
-	}
 	add_story->del_psn = MEMTX_TX_ROLLBACKED_PSN; // psn = 1;
 }
 
@@ -1539,6 +1600,8 @@ memtx_tx_history_rollback_deleted_story(struct txn_stmt *stmt)
 			assert(test_stmt->txn->psn == 0);
 			memtx_tx_story_link_deleted_by(del_story, test_stmt);
 		}
+
+		memtx_tx_handle_dups_in_secondary_indexes(del_story);
 
 		/* Откатываем присвоение psn. */
 		del_story->del_psn = 0;
@@ -1800,48 +1863,11 @@ memtx_tx_history_prepare_insert_stmt(struct txn_stmt *stmt)
 		memtx_tx_handle_conflict_gap_readers(top_story, 0, stmt->txn);
 	}
 
-	/* Обработка конфликтов во вторичных индексах. */
+	memtx_tx_handle_dups_in_secondary_indexes(story);
+
 	for (uint32_t i = 1; i < story->index_count; i++) {
-		/*
-		 * Обработка вторичных cross-write конфликтов. Этот случай
-		 * слишком сложен и заслуживает пояснения на примере.
-		 * Представим спейс с первичным ключом (pk) по первому полю
-		 * и вторичным индексом (sk) по второму полю.
-		 * Представим себе 3 in-progress транзакции, которые выполняют
-		 * реплейсы {1, 1, 1}, {2, 1, 2} и {1, 1, 3} соответственно.
-		 * Что должно произойти, когда первая транзакция коммитится?
-		 * Обе другие транзакции пересекаются с текущей во вторичном ключе.
-		 * Но вторая транзакция с {2, 1, 2} должна быть зааборчена
-		 * (или отправлена в read view) из-за конфликта: она вводит
-		 * дубликат по вторичному ключу.
-		 * С другой стороны третья транзакция с таплом {1, 1, 3} имеет
-		 * право на существование, т.к. перезаписывает {1, 1, 1}
-		 * в обоих - вторичном и первичном индексах.
-		 * Чтобы обработать эти конфликты, мы должны просканировать
-		 * цепочки в направлении верхушки и проверить все insert стейтменты.
-		 */
-		struct memtx_story *newer_story = story;
-		while (newer_story->link[i].newer_story != NULL) {
-			newer_story = newer_story->link[i].newer_story;
-			struct txn_stmt *test_stmt = newer_story->add_stmt;
-			/* Не конфликтуем с собственными изменениями. */
-			if (test_stmt->txn == stmt->txn)
-				continue;
-			/* Вставка после удаления этой же транзакцией. */
-			if (test_stmt->is_own_change &&
-			    test_stmt->del_story == NULL)
-				continue;
-			/* Если стейтмент перезаписывает нас в первичном индексе, то все ок. */
-			if (test_stmt->del_story == story)
-				continue;
-			/*
-			 * По вторичному индексу транзакция перезаписала нашу story,
-			 * которую мы сейчас препейрим, но удалила другую. Пока не
-			 * понятно, почему мы не отправили сразу в read view. Видимо,
-			 * эта ситуация может меняться со временем.
-			 */
-			txn_send_to_read_view(test_stmt->txn, stmt->txn->psn);
-		}
+		struct memtx_story *top_story =
+			memtx_tx_story_find_top(story, i);
 		/*
 		 * Мы уже обработали gap readers для вставки в первичный индекс.
 		 * В любом (replace или insert) случае мы должны обработать gap
@@ -1851,7 +1877,7 @@ memtx_tx_history_prepare_insert_stmt(struct txn_stmt *stmt)
 		 * добавить одну проверку и не заплатили бы за нее ничего, зато был
 		 * бы порядок.
 		 */
-		memtx_tx_handle_conflict_gap_readers(newer_story, i, stmt->txn);
+		memtx_tx_handle_conflict_gap_readers(top_story, i, stmt->txn);
 	}
 
 	/* Выставляем PSNs в stories, чтобы показать, что они - prepared. */
@@ -1947,7 +1973,9 @@ memtx_tx_history_commit_stmt(struct txn_stmt *stmt)
 
 	/*
 	 * Отсоединяем add_story и del_story от стейтмента. Не понятно, почему это
-	 * делается только на коммите, а не на prepare.
+	 * делается только на коммите, а не на prepare. Видимо потому, что prepared
+	 * еще могут перейти в состояние rolled back, и нам понадобится информация
+	 * об этих ссылках.
 	 */
 	if (stmt->add_story != NULL) {
 		assert(stmt->add_story->add_stmt == stmt);
