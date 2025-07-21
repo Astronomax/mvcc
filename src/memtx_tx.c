@@ -17,6 +17,7 @@ static_assert((int)MEMTX_TX_ROLLBACKED_PSN < (int)TXN_MIN_PSN,
 struct memtx_story;
 
 struct memtx_story_link {
+	bool is_own_change;
 	struct memtx_story *newer_story;
 	struct memtx_story *older_story;
     /*
@@ -364,6 +365,7 @@ memtx_tx_story_new(struct memtx_space *space, struct tuple *tuple)
 	rlist_add_tail(&txm.all_stories, &story->in_all_stories);
 
 	for (uint32_t i = 0; i < index_count; i++) {
+		story->link[i].is_own_change = false;
 		story->link[i].newer_story = story->link[i].older_story = NULL;
 		rlist_create(&story->link[i].read_gaps);
 		story->link[i].in_index = space->index[i];
@@ -946,7 +948,7 @@ memtx_tx_story_delete_is_visible(struct memtx_story *story, struct txn *txn, boo
 	struct txn_stmt *dels = story->del_stmt;
 	while (dels != NULL) {
 		if (dels->txn == txn) {
-			*is_own_change = true;
+			*is_own_change = (dels->add_story == NULL);
 			return true;
 		}
 		dels = dels->next_in_del_list;
@@ -1103,11 +1105,13 @@ memtx_tx_track_read(struct txn *txn, struct memtx_space *space, struct tuple *tu
  * `is_own_change` выставляется в true если `old_tuple` был изменен (
  * удален или добавлен) транзакцией данного стейтмента.
  */
-static int
-check_dup(struct txn_stmt *stmt, struct tuple *new_tuple, struct tuple **directly_replaced, struct tuple **old_tuple, enum dup_replace_mode mode, bool *is_own_change)
+check_dup(struct txn_stmt *stmt, struct tuple **directly_replaced, 	struct tuple **old_tuple, enum dup_replace_mode mode)
 {
 	struct memtx_space *space = stmt->space;
 	struct txn *txn = stmt->txn;
+	struct memtx_story *add_story = stmt->add_story;
+	assert(add_story != NULL);
+	struct tuple *new_tuple = add_story->tuple;
 
 	struct tuple *visible_replaced;
 	if (directly_replaced[0] == NULL ||
@@ -1116,12 +1120,13 @@ check_dup(struct txn_stmt *stmt, struct tuple *new_tuple, struct tuple **directl
          * внимательно смотреть, какая версия видна нам.
          */
 	    !tuple_has_flag(directly_replaced[0], TUPLE_IS_DIRTY)) {
-		*is_own_change = false;
+		add_story->link[0].is_own_change = false;
 		visible_replaced = directly_replaced[0];
 	} else {
 		struct memtx_story *story = memtx_tx_story_get(directly_replaced[0]);
-		memtx_tx_story_find_visible_tuple(story, txn, 0, true, &visible_replaced, is_own_change);
+		memtx_tx_story_find_visible_tuple(story, txn, 0, true, &visible_replaced, &add_story->link[0].is_own_change);
 	}
+	stmt->is_own_change = add_story->link[0].is_own_change;
 
     /* old_tuple' == old_tuple, dup_tuple == visible_replaced */
 	if (index_check_dup(space->index[0], *old_tuple, new_tuple, visible_replaced, mode) != 0) {
@@ -1141,11 +1146,11 @@ check_dup(struct txn_stmt *stmt, struct tuple *new_tuple, struct tuple **directl
 		struct tuple *visible;
 		if (!tuple_has_flag(directly_replaced[i], TUPLE_IS_DIRTY)) {
 			visible = directly_replaced[i];
+			add_story->link[i].is_own_change = false;
 		} else {
 			/* У тапла есть какая-то нетривиальная история. */
 			struct memtx_story *story = memtx_tx_story_get(directly_replaced[i]);
-			bool unused;
-			memtx_tx_story_find_visible_tuple(story, txn, i, true, &visible, &unused);
+			memtx_tx_story_find_visible_tuple(story, txn, i, true, &visible, &add_story->link[i].is_own_change);
 		}
         /* old_tuple' == visible_replaced, dup_tuple == visible */
 		if (index_check_dup(space->index[i], visible_replaced, new_tuple, visible, DUP_INSERT) != 0) {
@@ -1218,16 +1223,17 @@ memtx_tx_history_add_insert_stmt(struct txn_stmt *stmt, struct tuple *old_tuple,
 	}
 	directly_replaced_count = space->index_count;
 
-	/* Проверяем, что все условия удовлетворены, а также получаем видимый old_tuple. */
-	bool is_own_change = false;
-	int rc = check_dup(stmt, new_tuple, directly_replaced, &old_tuple, mode, &is_own_change);
-	if (rc != 0)
-		goto fail;
-    /* Выставили is_own_change для стейтмента. */
-	stmt->is_own_change = is_own_change;
-
 	/* Запомнили, что эта story была создана этим стейтментом. */
 	memtx_tx_story_link_added_by(add_story, stmt);
+
+	/* Проверяем, что все условия удовлетворены, а также получаем видимый old_tuple. */
+	int rc = check_dup(stmt, directly_replaced, &old_tuple, mode);
+	if (rc != 0)
+		goto fail;
+
+	/* Это неправда. */
+	//for (int i = 1; i < add_story->index_count; i++)
+	//	assert(add_story->link[i].is_own_change == add_story->link[0].is_own_change);
 
 	/* Создаем, если необходимо, story для замененного тапла. */
 	struct tuple *next_pk = directly_replaced[0];
@@ -1298,7 +1304,7 @@ memtx_tx_history_add_insert_stmt(struct txn_stmt *stmt, struct tuple *old_tuple,
 	 * before replace или on_replace, то он видел тапл, который был заменен, поэтому в данном
 	 * случае придется трекать чтение story, чтобы гарантировать, что тапл останется тем же.
 	 */
-	if (!is_own_change &&
+	if (!stmt->is_own_change &&
 	    (mode == DUP_INSERT/* ||
 	     space_has_before_replace_triggers(stmt->space) ||
 	     space_has_on_replace_triggers(stmt->space)*/)) {
@@ -1314,6 +1320,9 @@ memtx_tx_history_add_insert_stmt(struct txn_stmt *stmt, struct tuple *old_tuple,
 	return 0;
 
 fail:
+	/* Unlink add_story. */
+	memtx_tx_story_unlink_added_by(add_story, stmt);
+
 	/* Откатываем то, что уже успели применить. */
 	for (uint32_t i = directly_replaced_count - 1; i + 1 > 0; i--) {
 		struct index *index = space->index[i];
@@ -1445,7 +1454,7 @@ memtx_tx_handle_dups_in_secondary_indexes(struct memtx_story *story)
 				continue;
 			assert(test_stmt->txn->psn == 0);
 			/* Вставка после удаления этой же транзакцией. */
-			if (test_stmt->is_own_change &&
+			if (newer_story->link[i].is_own_change &&
 			    test_stmt->del_story == NULL)
 				continue;
 			/*
