@@ -18,7 +18,7 @@ int
 box_txn_rollback(void);
 
 int
-box_get(struct memtx_space *space, int key, struct tuple **result);
+box_get(struct memtx_space *space, uint32_t index_id, int key, struct tuple **result);
 
 int
 box_insert(struct memtx_space *space, struct tuple *new_tuple);
@@ -27,7 +27,7 @@ int
 box_replace(struct memtx_space *space, struct tuple *new_tuple);
 
 int
-box_delete(struct memtx_space *space, uint32_t index_id, int key);
+box_delete(struct memtx_space *space, uint32_t index_id, int key, struct tuple **result);
 
 #ifdef __cplusplus
 } // extern "C"

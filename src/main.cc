@@ -45,9 +45,9 @@ main_f(va_list ap)
 
     box_txn_begin();
     struct tuple *res = NULL;
-    box_get(space, 1, &res);
+    box_get(space, 0, 1, &res);
     fprintf(stderr, "get(1): %s\n", tuple_str(res));
-    box_get(space, 2, &res);
+    box_get(space, 0, 2, &res);
     fprintf(stderr, "get(2): %s\n", tuple_str(res));
     box_txn_commit();
 

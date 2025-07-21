@@ -6,6 +6,10 @@
 #include "small/rlist.h"
 #include "stdbool.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * Incremental counter for psn (prepare sequence number) of a transaction.
  * The next prepared transaction will get psn == txn_next_psn++.
@@ -221,6 +225,12 @@ txn_begin_ro_stmt(struct txn *txn)
 	return 0;
 }
 
+void
+txn_free(struct txn *txn);
+
+int
+txn_prepare(struct txn *txn);
+
 int
 txn_commit(struct txn *txn);
 
@@ -244,3 +254,7 @@ txn_send_to_read_view(struct txn *txn, int64_t psn);
  */
 void
 txn_abort_with_conflict(struct txn *txn);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif

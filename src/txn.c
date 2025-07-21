@@ -192,6 +192,7 @@ txn_begin(void)
 
 	rlist_add_tail_entry(&txns, txn, in_txns);
 	stailq_create(&txn->stmts);
+	txn->flags = 0;
 	txn->id = ++tsn;
 	txn->psn = 0;
 	txn->rv_psn = 0;
@@ -230,7 +231,7 @@ txn_begin_stmt(struct txn *txn, struct memtx_space *space)
 }
 
 /** Prepare a transaction using engines, run triggers, etc. */
-static int
+int
 txn_prepare(struct txn *txn)
 {
 	if (txn_check_can_continue(txn) != 0)

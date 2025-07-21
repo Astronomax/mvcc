@@ -41,14 +41,15 @@ box_txn_rollback(void)
 }
 
 int
-box_get(struct memtx_space *space, int key, struct tuple **result)
+box_get(struct memtx_space *space, uint32_t index_id, int key, struct tuple **result)
 {
 	struct txn *txn = in_txn();
     if (txn == NULL)
         return -1;
 	if (txn_begin_ro_stmt(txn) != 0)
         return -1;
-	if (memtx_space_get(space, key, result) != 0) {
+	struct index *index = space->index[index_id];
+	if (index_get(index, key, result) != 0) {
 		txn_rollback_stmt(txn);
 		return -1;
 	}
@@ -58,13 +59,13 @@ box_get(struct memtx_space *space, int key, struct tuple **result)
 int
 box_insert(struct memtx_space *space, struct tuple *new_tuple)
 {
-	struct tuple *tuple = NULL;
+	struct tuple *unused = NULL;
 	struct txn *txn = in_txn();
     if (txn == NULL)
         return -1;
 	if (txn_begin_stmt(txn, space) != 0)
         return -1;
-	if (memtx_space_execute_replace(space, txn, new_tuple, DUP_INSERT, &tuple) != 0) {
+	if (memtx_space_execute_replace(space, txn, new_tuple, DUP_INSERT, &unused) != 0) {
 		txn_rollback_stmt(txn);
 		return -1;
 	}
@@ -74,13 +75,13 @@ box_insert(struct memtx_space *space, struct tuple *new_tuple)
 int
 box_replace(struct memtx_space *space, struct tuple *new_tuple)
 {
-	struct tuple *tuple = NULL;
+	struct tuple *unused = NULL;
 	struct txn *txn = in_txn();
     if (txn == NULL)
         return -1;
 	if (txn_begin_stmt(txn, space) != 0)
         return -1;
-	if (memtx_space_execute_replace(space, txn, new_tuple, DUP_REPLACE_OR_INSERT, &tuple) != 0) {
+	if (memtx_space_execute_replace(space, txn, new_tuple, DUP_REPLACE_OR_INSERT, &unused) != 0) {
 		txn_rollback_stmt(txn);
 		return -1;
 	}
@@ -88,15 +89,14 @@ box_replace(struct memtx_space *space, struct tuple *new_tuple)
 }
 
 int
-box_delete(struct memtx_space *space, uint32_t index_id, int key)
+box_delete(struct memtx_space *space, uint32_t index_id, int key, struct tuple **result)
 {
-	struct tuple *tuple = NULL;
 	struct txn *txn = in_txn();
     if (txn == NULL)
         return -1;
 	if (txn_begin_stmt(txn, space) != 0)
         return -1;
-	if (memtx_space_execute_delete(space, txn, index_id, key, &tuple) != 0) {
+	if (memtx_space_execute_delete(space, txn, index_id, key, result) != 0) {
 		txn_rollback_stmt(txn);
 		return -1;
 	}

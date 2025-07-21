@@ -138,7 +138,6 @@ set (sources
     src/box.c
     src/index.cc
     src/key_def.cc
-    src/main.cc
     src/memtx_engine.c
     src/memtx_space.c
     src/memtx_tx.c
@@ -146,6 +145,10 @@ set (sources
     src/txn.c
 )
 
-add_executable(memtx_tx ${sources})
+add_executable(memtx_tx src/main.cc ${sources})
 add_dependencies(memtx_tx small core ev)
 target_link_libraries(memtx_tx small core ${LIBEV_LIBRARIES})
+
+add_executable(stress src/stress.cc ${sources})
+add_dependencies(stress small core ev)
+target_link_libraries(stress small core ${LIBEV_LIBRARIES})
