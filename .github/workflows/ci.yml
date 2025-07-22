@@ -1,0 +1,64 @@
+name: Stress Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake g++
+
+    - name: Change submodule URLs from SSH to HTTPS
+      run: |
+        git submodule set-url -- src/lib/small https://github.com/tarantool/small.git
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+    - name: Update submodules
+      run: |
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+    - name: Create build directory
+      run: mkdir -p build
+
+    - name: Configure CMake
+      working-directory: ./build
+      run: cmake ..
+
+    - name: Build project
+      working-directory: ./build
+      run: cmake --build . --config Release
+
+    - name: Run stress test 30 times
+      working-directory: ./build
+      run: |
+        for i in {1..30}; do
+          echo -n "Run #$i/30... "
+
+          OUTPUT=$(./stress 2>&1)
+          STATUS=$?
+          
+          if [ $STATUS -eq 0 ]; then
+              echo "OK"
+          else
+              echo "FAILED"
+              echo "=== Crash on run #$1 ==="
+              echo "Exit status: $STATUS"
+              echo "=== Program output ==="
+              echo "$OUTPUT"
+              exit 1
+          fi
+        done

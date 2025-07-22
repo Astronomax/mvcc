@@ -1,5 +1,7 @@
 # transaction-manager
 
+[![CI](https://github.com/Astronomax/transaction-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/Astronomax/transaction-manager/actions/workflows/ci.yml)
+
 This project provides a **simplified, heavily commented** implementation of [Tarantool](https://github.com/tarantool/tarantool)'s transaction manager (see `memtx_tx.c`) core functionality, designed for educational purposes. It demonstrates the fundamental transaction mechanics used in Tarantool while removing complex production features to focus on the essential concepts. If you want to understand how the Tarantool's transaction manager works, it is highly recommended to start with this repository. You can simply come up with some complex scenario and then run this project under the debugger or with debug prints.
 
 
