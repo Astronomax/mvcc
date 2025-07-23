@@ -2,6 +2,7 @@
 #include "key_def.h"
 #include "salad/stailq.h"
 #include "memtx_space.h"
+#include "index.h"
 
 enum {
 	/**
@@ -117,35 +118,88 @@ struct point_hole_item {
 	bool is_head;
 };
 
-struct inplace_gap_item {
+enum gap_item_type {
+	/**
+	 * The transaction have read some tuple that is not committed and thus
+	 * not visible. In this case the further commit of that tuple can cause
+	 * a conflict, as well as any overwrite of that tuple.
+	 */
+	GAP_INPLACE,
+	/**
+	 * The transaction made a select or range scan, reading a key or range
+	 * between two adjacent tuples of the index. For that case a consequent
+	 * write to that range can cause a conflict. Such an item will be stored
+	 * in successor's story, or index->read_gaps if there's no successor.
+	 */
+	GAP_NEARBY,
+	/**
+	 * Транзакция завершила фулскан НЕУПОРЯДОЧЕННОГО индекса. После этого
+	 * любая последующая запись в любую новую позицию индекса должна приводить
+	 * к конфликту. Такой элемент будет сохранён в index->read_gaps.
+	 * 
+	 * Пока не будем поддерживать неупорядоченные индексы.
+	 */
+	//GAP_FULL_SCAN,
+};
+
+struct gap_item_base {
+	enum gap_item_type type;
     /* Якорь в memtx_story_link::read_gaps или index::read_gaps. */
 	struct rlist in_read_gaps;
 	struct rlist in_gap_list;
 	struct txn *txn;
 };
 
+struct inplace_gap_item {
+	struct gap_item_base base;
+};
+
+struct nearby_gap_item {
+	struct gap_item_base base;
+	struct key_or_null key;
+	enum iterator_type type;
+};
+
+struct full_scan_gap_item {
+	struct gap_item_base base;
+};
+
 static void
-gap_item_base_create(struct inplace_gap_item *item, struct txn *txn) {
+gap_item_base_create(struct gap_item_base *item, enum gap_item_type type, struct txn *txn)
+{
+	item->type = type;
 	item->txn = txn;
     /* У транзакции может быть несколько inplace_gap_item. */
 	rlist_add(&txn->gap_list, &item->in_gap_list);
 }
 
-/** Учтите, что in_read_gaps должен быть проинициализирован позже. */
+/**
+ * Allocate and create inplace gap item.
+ * Note that in_read_gaps base member must be initialized later.
+ */
 static struct inplace_gap_item *
-memtx_tx_inplace_gap_item_new(struct txn *txn) {
-	struct inplace_gap_item *item = (struct inplace_gap_item *)malloc(sizeof(struct inplace_gap_item));
-	gap_item_base_create(item, txn);
-	return item;
-}
+memtx_tx_inplace_gap_item_new(struct txn *txn);
 
+/**
+ * Allocate and create nearby gap item.
+ * Note that in_read_gaps base member must be initialized later.
+ */
+static struct nearby_gap_item *
+memtx_tx_nearby_gap_item_new(struct txn *txn, enum iterator_type type, struct key_or_null key);
+
+/**
+ * Allocate and create full scan gap item.
+ * Note that in_read_gaps base member must be initialized later.
+ */
+/* Пока для простоты не поддерживаем неупорядоченные индексы. */
+//static struct full_scan_gap_item *
+//memtx_tx_full_scan_gap_item_new(struct txn *txn);
+
+/**
+ * Destroy and free any kind of gap item.
+ */
 static void
-memtx_tx_inplace_gap_item_delete(struct inplace_gap_item *item) {
-    /* Удаляем из обоих списков. */
-    rlist_del(&item->in_gap_list);
-	rlist_del(&item->in_read_gaps);
-    free(item);
-}
+memtx_tx_delete_gap(struct gap_item_base *item);
 
 /* Хелпер структура для поиска point_hole_item в хеш-таблице */
 struct point_hole_key {
@@ -550,8 +604,8 @@ memtx_tx_story_link_top(struct memtx_story *new_top, struct memtx_story *old_top
 	if (!is_new_tuple) {
 		/* Делаем физиески реплейс. */
 		struct index *index = old_link->in_index;
-		struct tuple *removed/*, *unused*/;
-		if (index_replace(index, old_top->tuple, new_top->tuple, DUP_REPLACE, &removed/*, &unused*/) != 0) {
+		struct tuple *removed, *unused;
+		if (index_replace(index, old_top->tuple, new_top->tuple, DUP_REPLACE, &removed, &unused) != 0) {
 			/*panic*/fprintf(stderr, "failed to rebind story in index\n");
 			exit(1);
 		}
@@ -674,9 +728,8 @@ memtx_tx_story_full_unlink_on_space_delete(struct memtx_story *story)
 	for (uint32_t i = 0; i < story->index_count; i++) {
 		struct rlist *read_gaps = &story->link[i].read_gaps;
 		while (!rlist_empty(&story->link[i].read_gaps)) {
-			struct inplace_gap_item *item = rlist_first_entry(read_gaps, struct inplace_gap_item, in_read_gaps);
-			//memtx_tx_delete_gap(item);
-			memtx_tx_inplace_gap_item_delete(item);
+			struct gap_item_base *item = rlist_first_entry(read_gaps, struct gap_item_base, in_read_gaps);
+			memtx_tx_delete_gap(item);
 		}
 	}
 	/*
@@ -756,8 +809,8 @@ memtx_tx_story_full_unlink_story_gc_step(struct memtx_story *story)
              */
             if (story->del_psn > 0) {
                 struct index *index = link->in_index;
-				struct tuple *removed/*, *unused*/;
-				if (index_replace(index, story->tuple, NULL, DUP_INSERT, &removed/*, &unused*/) != 0) {
+				struct tuple *removed, *unused;
+				if (index_replace(index, story->tuple, NULL, DUP_INSERT, &removed, &unused) != 0) {
 					/*panic*/fprintf(stderr, "failed to rollback change\n");
 					exit(1);
 				}
@@ -1175,7 +1228,90 @@ memtx_tx_track_story_gap(struct txn *txn, struct memtx_story *story, uint32_t in
 	assert(story->link[ind].newer_story == NULL);
 	assert(txn != NULL);
 	struct inplace_gap_item *item = memtx_tx_inplace_gap_item_new(txn);
-	rlist_add(&story->link[ind].read_gaps, &item->in_read_gaps);
+	rlist_add(&story->link[ind].read_gaps, &item->base.in_read_gaps);
+}
+
+/**
+ * Обработать вставку в новое место индекса. Могут быть читатели, которые читали
+ * из этого пробела (gap), и поэтому должны быть отправлены в read view или
+ * или зааборчены по конфликту.
+ */
+static void
+memtx_tx_handle_gap_write(struct memtx_space *space, struct memtx_story *story, struct tuple *successor, uint32_t ind)
+{
+	assert(story->link[ind].newer_story == NULL);
+	struct tuple *tuple = story->tuple;
+	struct index *index = space->index[ind];
+	struct gap_item_base *item_base, *tmp;
+	/* Пока для простоты не поддерживаем неупорядоченные индексы. */
+	//rlist_foreach_entry_safe(item_base, &index->read_gaps, in_read_gaps, tmp) {
+	//	if (item_base->type != GAP_FULL_SCAN)
+	//		continue;
+	//	/*
+	//	 * Для GAP_FULL_SCAN появление тапла в каком-то месте, где раньше ничего не было
+	//	 * должно создавать gap-трекер для соответствующего ключа. Чтобы, когда данный
+	//	 * тапл станет prepared, транзакция, которая выполняющая full scan была зааборчена.
+	//	 */
+	//	memtx_tx_track_story_gap(item_base->txn, story, ind);
+	//}
+	if (successor != NULL && !tuple_has_flag(successor, TUPLE_IS_DIRTY))
+		return; /* no gap records */
+
+	/* Если следующего нет, смотрим на gaps в индексе. */
+	struct rlist *list = &index->read_gaps;
+	if (successor != NULL) {
+		assert(tuple_has_flag(successor, TUPLE_IS_DIRTY));
+		struct memtx_story *succ_story = memtx_tx_story_get(successor);
+		assert(ind < succ_story->index_count);
+		/* Если следующий есть, смотрим на его gaps. */
+		list = &succ_story->link[ind].read_gaps;
+		assert(list->next != NULL && list->prev != NULL);
+	}
+	rlist_foreach_entry_safe(item_base, list, in_read_gaps, tmp) {
+		if (item_base->type != GAP_NEARBY)
+			continue;
+		struct nearby_gap_item *item = (struct nearby_gap_item *)item_base;
+		int cmp = 0;
+		if (!item->key.is_null) {
+			struct key_def *def = index->_key_def;
+			cmp = tuple_compare_with_key(tuple, item->key.key, def);
+		}
+		int dir = iterator_direction(item->type);
+		bool is_eq = item->type == ITER_EQ || item->type == ITER_REQ;
+		bool is_e = item->type == ITER_LE || item->type == ITER_GE;
+		/*
+		 * need split - это понятная вещь.
+		 * <--dir-- key <--cmp-- tuple
+		 * tuple -->cmp--> key --dir-->
+		 * В этом случае все nearby gap-трекеры должны быть скопированы в tuple (в story соотв. tuple)
+		 */
+		bool need_split = item->key.is_null || (dir * cmp > 0 && !is_eq);
+
+		bool need_move = !need_split &&
+				 ((dir < 0 && cmp > 0) ||
+				  (cmp > 0 && item->type == ITER_EQ) ||
+				  (cmp == 0 && (dir < 0 || item->type == ITER_LT)));
+		bool need_track = need_split || (cmp == 0 && is_e);
+		if (need_track)
+			memtx_tx_track_story_gap(item_base->txn, story, ind);
+		if (need_split) {
+			/*
+			 * The insertion divided the gap into two parts.
+			 * Old tracker is left in one gap, let's copy tracker
+			 * to another.
+			 */
+			struct nearby_gap_item *copy = memtx_tx_nearby_gap_item_new(item_base->txn, item->type, item->key);
+			rlist_add(&story->link[ind].read_gaps, &copy->base.in_read_gaps);
+		} else if (need_move) {
+			/* The tracker must be moved to the left gap. */
+			rlist_del(&item->base.in_read_gaps);
+			rlist_add(&story->link[ind].read_gaps, &item->base.in_read_gaps);
+		} else {
+			assert((dir > 0 && cmp < 0) ||
+			       (cmp < 0 && item->type == ITER_REQ) ||
+			       (cmp == 0 && (dir > 0 || item->type == ITER_GT)));
+		}
+	}
 }
 
 static void
@@ -1208,14 +1344,14 @@ memtx_tx_history_add_insert_stmt(struct txn_stmt *stmt, struct tuple *old_tuple,
      * заменили (directly_replaced[i]), и какой элемент был следующим (direct_successor[i]).
      */
 	struct tuple *directly_replaced[space->index_count];
-	//struct tuple *direct_successor[space->index_count];
+	struct tuple *direct_successor[space->index_count];
 	uint32_t directly_replaced_count = 0;
 	for (uint32_t i = 0; i < space->index_count; i++) {
 		struct index *index = space->index[i];
 		struct tuple **replaced = &directly_replaced[i];
-		//struct tuple **successor = &direct_successor[i];
-		*replaced /*= *successor*/ = NULL;
-		if (index_replace(index, NULL, new_tuple, DUP_REPLACE_OR_INSERT, replaced/*, successor*/) != 0)
+		struct tuple **successor = &direct_successor[i];
+		*replaced = *successor = NULL;
+		if (index_replace(index, NULL, new_tuple, DUP_REPLACE_OR_INSERT, replaced, successor) != 0)
 		{
 			directly_replaced_count = i;
 			goto fail;
@@ -1247,17 +1383,12 @@ memtx_tx_history_add_insert_stmt(struct txn_stmt *stmt, struct tuple *old_tuple,
 	/* Collect conflicts or form chains. */
 	for (uint32_t i = 0; i < space->index_count; i++) {
 		struct tuple *next = directly_replaced[i];
-		//struct tuple *succ = direct_successor[i];
+		struct tuple *succ = direct_successor[i];
 		struct index *index = space->index[i];
 		//bool tuple_is_excluded = memtx_tx_tuple_key_is_excluded(new_tuple, index, &index->_key_def);
 		if (next == NULL/* && !tuple_is_excluded*/) {
 			/* Collect conflicts. */
-			/*
-			 * memtx_tx_handle_gap_write не обрабатывает inplace gap'ы,
-			 * а нас пока интересуют именно они.
-			 */
-			//memtx_tx_handle_gap_write(space, add_story, succ, i);
-
+			memtx_tx_handle_gap_write(space, add_story, succ, i);
 			/*
 			 * Данная story - первая в цепочке, а значит, нужно перенести в неё
 			 * те пробелы, которые хранятся в нас в мапчике. (Удалить из мапчика
@@ -1327,7 +1458,7 @@ fail:
 	for (uint32_t i = directly_replaced_count - 1; i + 1 > 0; i--) {
 		struct index *index = space->index[i];
 		struct tuple *unused;
-		if (index_replace(index, new_tuple, directly_replaced[i], DUP_INSERT, &unused/*, &unused*/) != 0) {
+		if (index_replace(index, new_tuple, directly_replaced[i], DUP_INSERT, &unused, &unused) != 0) {
 			//diag_log();
 			/*panic*/fprintf(stderr, "failed to rollback change\n");
 			exit(1);
@@ -1564,11 +1695,10 @@ memtx_tx_abort_gap_readers(struct memtx_story *story)
 		 * верхушке цепочки. Выше уже обсуждали наличие данного инварианта.
 		 */
 		struct memtx_story *top = memtx_tx_story_find_top(story, i);
-		struct inplace_gap_item *item, *tmp;
+		struct gap_item_base *item, *tmp;
 		rlist_foreach_entry_safe(item, &top->link[i].read_gaps, in_read_gaps, tmp) {
-			/* Пока что для понимания у нас все gap'ы - inplace. */
-			//if (item->type != GAP_INPLACE)
-			//	continue;
+			if (item->type != GAP_INPLACE)
+				continue;
 			txn_abort_with_conflict(item->txn);
 		}
 	}
@@ -1656,7 +1786,7 @@ memtx_tx_history_rollback_empty_stmt(struct txn_stmt *stmt)
 		return;
 	for (size_t i = 0; i < stmt->space->index_count; i++) {
 		struct tuple *unused;
-		if (index_replace(stmt->space->index[i], new_tuple, old_tuple, DUP_REPLACE_OR_INSERT, &unused/*, &unused*/) != 0) {
+		if (index_replace(stmt->space->index[i], new_tuple, old_tuple, DUP_REPLACE_OR_INSERT, &unused, &unused) != 0) {
 			/*panic*/fprintf(stderr, "failed to rebind story in index on "
 			      "rollback of statement without story\n");
 			exit(1);
@@ -1723,9 +1853,9 @@ static void
 memtx_tx_handle_conflict_gap_readers(struct memtx_story *top_story, uint32_t ind, struct txn *writer)
 {
 	assert(top_story->link[ind].newer_story == NULL);
-	struct inplace_gap_item *item, *tmp;
+	struct gap_item_base *item, *tmp;
 	rlist_foreach_entry_safe(item, &top_story->link[ind].read_gaps, in_read_gaps, tmp) {
-		if (item->txn == writer/* || item->type != GAP_INPLACE*/)
+		if (item->txn == writer || item->type != GAP_INPLACE)
 			continue;
 		txn_send_to_read_view(item->txn, writer->psn);
 	}
@@ -2125,6 +2255,15 @@ memtx_tx_tuple_key_is_visible_slow(struct txn *txn, struct memtx_space *space, s
 	return visible != NULL;
 }
 
+static void
+memtx_tx_delete_gap(struct gap_item_base *item)
+{
+    /* Удаляем из обоих списков. */
+    rlist_del(&item->in_gap_list);
+	rlist_del(&item->in_read_gaps);
+    free(item);
+}
+
 /**
  * Аллоцирует и инициализирует tx_read_tracker, возвращает NULL
  * в случае ошибки. Линки в спиках не инициализируются.
@@ -2316,14 +2455,88 @@ memtx_tx_track_point_slow(struct txn *txn, struct index *index, int key)
 {
 	if (txn->status != TXN_INPROGRESS)
 		return;
-
-	//key_def *def = index->def->_key_def;
-	//const char *tmp = key;
-	//for (uint32_t i = 0; i < def->part_count; i++)
-	//	mp_next(&tmp);
-	//size_t key_len = tmp - key;
 	point_hole_storage_new(index, key, txn);
 }
+
+/** Учтите, что in_read_gaps должен быть проинициализирован позже. */
+static struct inplace_gap_item *
+memtx_tx_inplace_gap_item_new(struct txn *txn)
+{
+	struct inplace_gap_item *item = (struct inplace_gap_item *)malloc(sizeof(struct inplace_gap_item));
+	gap_item_base_create(&item->base, GAP_INPLACE, txn);
+	return item;
+}
+
+/** Учтите, что in_read_gaps должен быть проинициализирован позже. */
+static struct nearby_gap_item *
+memtx_tx_nearby_gap_item_new(struct txn *txn, enum iterator_type type, struct key_or_null key)
+{
+	struct nearby_gap_item *item = (struct nearby_gap_item *)malloc(sizeof(struct nearby_gap_item));
+	gap_item_base_create(&item->base, GAP_NEARBY, txn);
+	item->type = type;
+	item->key = key;
+	return item;
+}
+
+/**
+ * Allocate and create full scan gap item.
+ * Note that in_read_gaps base member must be initialized later.
+ */
+/* Пока для простоты не поддерживаем неупорядоченные индексы. */
+//static struct full_scan_gap_item *
+//memtx_tx_full_scan_gap_item_new(struct txn *txn)
+//{
+//	struct full_scan_gap_item *item = (struct full_scan_gap_item *)malloc(sizeof(struct full_scan_gap_item));
+//	gap_item_base_create(&item->base, GAP_FULL_SCAN, txn);
+//	return item;
+//}
+
+/**
+ * Record in TX manager that a transaction @a txn have read nothing
+ * from @a space and @a index with @a key, somewhere from interval between
+ * some unknown predecessor and @a successor.
+ * This function must be used for ordered indexes, such as TREE, for queries
+ * when iteration type is not EQ or when the key is not full (otherwise
+ * it's faster to use memtx_tx_track_point).
+ */
+void
+memtx_tx_track_gap_slow(struct txn *txn, struct memtx_space *space, struct index *index,
+			struct tuple *successor, enum iterator_type type, struct key_or_null key)
+{
+	if (txn->status != TXN_INPROGRESS)
+		return;
+
+	struct nearby_gap_item *item = memtx_tx_nearby_gap_item_new(txn, type, key);
+
+	if (successor != NULL) {
+		struct memtx_story *story;
+		if (tuple_has_flag(successor, TUPLE_IS_DIRTY))
+			story = memtx_tx_story_get(successor);
+		else
+			story = memtx_tx_story_new(space, successor);
+		assert(index->dense_id < story->index_count);
+		assert(story->link[index->dense_id].in_index != NULL);
+		rlist_add(&story->link[index->dense_id].read_gaps, &item->base.in_read_gaps);
+	} else {
+		rlist_add(&index->read_gaps, &item->base.in_read_gaps);
+	}
+}
+
+/**
+ * Record in TX manager that a transaction @a txn have read full @a index.
+ * This function must be used for unordered indexes, such as HASH, for queries
+ * when iteration type is ALL.
+ */
+/* Пока для простоты не поддерживаем неупорядоченные индексы. */
+//void
+//memtx_tx_track_full_scan_slow(struct txn *txn, struct index *index)
+//{
+//	if (txn->status != TXN_INPROGRESS)
+//		return;
+//
+//	struct full_scan_gap_item *item = memtx_tx_full_scan_gap_item_new(txn);
+//	rlist_add(&index->read_gaps, &item->base.in_read_gaps);
+//}
 
 /* Clean and clear all read lists of @a txn. */
 static void
@@ -2334,8 +2547,8 @@ memtx_tx_clear_txn_read_lists(struct txn *txn)
 		point_hole_storage_delete(object);
 	}
 	while (!rlist_empty(&txn->gap_list)) {
-		struct inplace_gap_item *item = rlist_first_entry(&txn->gap_list, struct inplace_gap_item, in_gap_list);
-		memtx_tx_inplace_gap_item_delete(item);
+		struct gap_item_base *item = rlist_first_entry(&txn->gap_list, struct gap_item_base, in_gap_list);
+		memtx_tx_delete_gap(item);
 	}
 
 	struct tx_read_tracker *tracker, *tmp;

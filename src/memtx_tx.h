@@ -151,8 +151,7 @@ memtx_tx_track_point_slow(struct txn *txn, struct index *index, int key);
  * Записать в TX менеджере, что транзакция @a txn ничего не прочитала
  * в спейсе @a space и индексе @a index по ключу @a key.
  *
- * Используется в ..._index_get_internal, остальные места использования
- * нас не интересуют. Вызывается, когда в индексе ничего не нашлось.
+ * Вызывается, когда в индексе ничего не нашлось.
  * Если в индексе нашелся какой-то тапл, то там позовется memtx_tx_tuple_clarify,
  * который в свою очередь вызовет memtx_tx_track_story_gap, если никакой тапл,
  * кроме NULL, не видим для транзакции.
@@ -172,13 +171,68 @@ memtx_tx_track_point(struct txn *txn, struct memtx_space *space, struct index *i
 }
 
 /**
+ * Helper of memtx_tx_track_gap.
+ */
+void
+memtx_tx_track_gap_slow(struct txn *txn, struct memtx_space *space, struct index *index,
+			struct tuple *successor, enum iterator_type type, struct key_or_null key);
+
+/**
+ * Record in TX manager that a transaction @a txn have read nothing
+ * from @a space and @a index with @a key, somewhere from interval between
+ * some unknown predecessor and @a successor.
+ * This function must be used for ordered indexes, such as TREE, for queries
+ * when iteration type is not EQ or when the key is not full (otherwise
+ * it's faster to use memtx_tx_track_point).
+ *
+ * NB: can trigger story garbage collection.
+ */
+static inline void
+memtx_tx_track_gap(struct txn *txn, struct memtx_space *space, struct index *index,
+		   struct tuple *successor, enum iterator_type type, struct key_or_null key)
+{
+	//if (!memtx_tx_manager_use_mvcc_engine)
+	//	return;
+	if (txn == NULL || space == NULL/* || space->def->opts.is_ephemeral*/)
+		return;
+	memtx_tx_track_gap_slow(txn, space, index, successor, type, key);
+}
+
+/**
+ * Helper of memtx_tx_track_full_scan.
+ */
+/* Пока для простоты не поддерживаем неупорядоченные индексы. */
+//void
+//memtx_tx_track_full_scan_slow(struct txn *txn, struct index *index);
+
+/**
+ * Record in TX manager that a transaction @a txn have read full @a index
+ * from @a space.
+ * This function must be used for unordered indexes, such as HASH, for queries
+ * when iteration type is ALL.
+ *
+ * NB: can trigger story garbage collection.
+ *
+ * @return 0 on success, -1 on memory error.
+ */
+/* Пока для простоты не поддерживаем неупорядоченные индексы. */
+//static inline void
+//memtx_tx_track_full_scan(struct txn *txn, struct space *space, struct index *index)
+//{
+//	//if (!memtx_tx_manager_use_mvcc_engine)
+//	//	return;
+//	if (txn == NULL || space == NULL/* || space->def->opts.is_ephemeral*/)
+//		return;
+//	memtx_tx_track_full_scan_slow(txn, index);
+//}
+
+/**
  * Clean a tuple if it's dirty - finds a visible tuple in history.
  *
  * @param txn - current transactions.
  * @param space - space in which the tuple was found.
  * @param tuple - tuple to clean.
  * @param index - index in which the tuple was found.
- * @param mk_index - multikey index (iа the index is multikey).
  * @return clean tuple (can be NULL).
  */
 static inline struct tuple *
