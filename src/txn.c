@@ -1,6 +1,8 @@
 #include "txn.h"
 #include "memtx_engine.h"
 #include "memtx_tx.h"
+#include "wal.h"
+
 #include "assert.h"
 #include "stdbool.h"
 
@@ -170,15 +172,86 @@ txn_rollback(struct txn *txn)
 	assert(!txn_has_flag(txn, TXN_IS_DONE));
 	assert(in_txn() == txn);
 	txn->status = TXN_ABORTED;
+
+	txn_complete_fail(txn);
+
+	//txn_set_flags(txn, TXN_IS_ROLLED_BACK);
+	//struct txn_stmt *stmt;
+	//stailq_reverse(&txn->stmts);
+	//stailq_foreach_entry(stmt, &txn->stmts, next)
+	//	txn_rollback_one_stmt(txn, stmt);
+	///* В случае mvcc это просто nop. */
+    ////engine_rollback(engine, txn);
+    //txn_free(txn);
+	fiber_set_txn(fiber(), NULL);
+}
+
+static void
+txn_on_journal_write(struct journal_entry *entry)
+{
+	struct txn *txn = entry->complete_data;
+	assert(txn->signature == TXN_SIGNATURE_UNKNOWN);
+	txn->signature = entry->res;
+	/*
+	 * Some commit/rollback triggers require for in_txn fiber
+	 * variable to be set so restore it for the time triggers
+	 * are in progress.
+	 */
+	assert(in_txn() == NULL);
+	fiber_set_txn(fiber(), txn);
+
+	if (txn->signature < 0)
+		txn_complete_fail(txn);
+	else
+		txn_complete_success(txn);
+
+	fiber_set_txn(fiber(), NULL);
+}
+
+/**
+ * If there is no fiber waiting for the transaction then the
+ * transaction could be safely freed. In the opposite case the
+ * owner fiber is in duty to free this transaction.
+ */
+static void
+txn_free_or_wakeup(struct txn *txn)
+{
+	if (txn->fiber == NULL)
+		txn_free(txn);
+	else {
+		txn_set_flags(txn, TXN_IS_DONE);
+		fiber_wakeup(txn->fiber);
+	}
+}
+
+void
+txn_complete_fail(struct txn *txn)
+{
+	assert(!txn_has_flag(txn, TXN_IS_DONE));
+	assert(in_txn() == txn);
+	txn->status = TXN_ABORTED;
 	txn_set_flags(txn, TXN_IS_ROLLED_BACK);
 	struct txn_stmt *stmt;
 	stailq_reverse(&txn->stmts);
 	stailq_foreach_entry(stmt, &txn->stmts, next)
 		txn_rollback_one_stmt(txn, stmt);
-	/* В случае mvcc это просто nop. */
-    //engine_rollback(engine, txn);
-    txn_free(txn);
-	fiber_set_txn(fiber(), NULL);
+	txn_free_or_wakeup(txn);
+	//assert(txn->fiber != NULL);
+	//txn_set_flags(txn, TXN_IS_DONE);
+	//fiber_wakeup(txn->fiber);
+}
+
+void
+txn_complete_success(struct txn *txn)
+{
+	assert(!txn_has_flag(txn, TXN_IS_DONE));
+	assert(txn->signature >= 0);
+	assert(in_txn() == txn);
+	txn->status = TXN_COMMITTED;
+	//txn_free_or_wakeup(txn);
+	assert(txn->fiber != NULL);
+	txn_set_flags(txn, TXN_IS_DONE);
+	fiber_wakeup(txn->fiber);
 }
 
 struct txn *
@@ -197,6 +270,8 @@ txn_begin(void)
 	txn->psn = 0;
 	txn->rv_psn = 0;
 	txn->status = TXN_INPROGRESS;
+	txn->signature = TXN_SIGNATURE_UNKNOWN;
+	txn->fiber = NULL;
 	fiber_set_txn(fiber(), txn);
 	/* обновляет статы, нам не надо. */
     //memtx_tx_register_txn(txn);
@@ -248,13 +323,40 @@ txn_prepare(struct txn *txn)
 	return 0;
 }
 
+struct journal_entry *
+txn_journal_entry_new(struct txn *txn)
+{
+	struct journal_entry *entry = journal_entry_new(txn_on_journal_write, txn);
+    entry->fiber = fiber();
+    entry->is_complete = false;
+    entry->errinj_wal_io = false;
+    return entry;
+}
+
 int
 txn_commit(struct txn *txn)
 {
+	struct journal_entry *req;
+	txn->fiber = fiber();
 	if (txn_prepare(txn) != 0)
 		goto rollback;
 	assert(!txn_has_flag(txn, TXN_IS_DONE));
 	assert(in_txn() == txn);
+
+	req = txn_journal_entry_new(txn);
+
+	fiber_set_txn(fiber(), NULL);
+	journal_write_submit(req);
+
+	while (!req->is_complete)
+		fiber_yield();
+	if (req->res < 0) {
+		//diag_set_journal_res(req->res);
+		goto rollback;
+	}
+
+	free(req);
+
 	txn->status = TXN_COMMITTED;
 	memtx_engine_commit(/*engine, */txn);
 	txn_set_flags(txn, TXN_IS_DONE);

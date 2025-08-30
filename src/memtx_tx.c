@@ -64,7 +64,7 @@ struct memtx_story {
 	/* Кол-во индексов мы тут прихранили. */
 	uint32_t index_count;
 	enum memtx_tx_story_status status;
-	struct memtx_story_link link[];
+	struct memtx_story_link link[BOX_INDEX_MAX];
 };
 
 static uint32_t
@@ -398,12 +398,12 @@ memtx_tx_story_new(struct memtx_space *space, struct tuple *tuple)
 	assert(!tuple_has_flag(tuple, TUPLE_IS_DIRTY));
 	uint32_t index_count = space->index_count;
 	struct memtx_story *story = (struct memtx_story *)
-        (malloc(sizeof(struct memtx_story) +
-            index_count * sizeof(struct memtx_story_link)));
+        (malloc(sizeof(struct memtx_story) ));/* +
+            BOX_INDEX_MAX * sizeof(struct memtx_story_link)));*/
 	story->tuple = tuple;
 
 	const struct memtx_story **put_story =
-	(const struct memtx_story **) &story;
+		(const struct memtx_story **) &story;
 	struct memtx_story *replaced = NULL;
 	struct memtx_story **preplaced = &replaced;
 	mh_history_put(txm.history, put_story, &preplaced, 0);
@@ -973,10 +973,9 @@ memtx_tx_story_insert_is_visible(struct memtx_story *story, struct txn *txn, boo
      * Пока не совсем понятно, как закоммиченная транзакция может не находиться
      * в зоне нашей видимости, разберемся позже.
      */
-	if (story->add_psn != 0 && story->add_stmt == NULL &&
-	    story->add_psn < rv_psn)
+	if (story->add_psn != 0 && story->add_stmt == NULL && story->add_psn < rv_psn)
 		return true;
-    
+
     /* Транзакция добавлена давно неизвестно кем. Её видят все. */
 	if (story->add_psn == 0 && story->add_stmt == NULL)
 		return true; /* Added long time ago. */
@@ -1314,6 +1313,81 @@ memtx_tx_handle_gap_write(struct memtx_space *space, struct memtx_story *story, 
 	}
 }
 
+/*
+ * After the last prepared story in a chain is modified (either when another
+ * story becomes last or when the del_psn of the last story becomes 0), some
+ * subsequent transactions may become duplicates. This function aborts all
+ * in-progress transactions that would lead to duplicates.
+ */
+static void
+memtx_tx_handle_dups_in_secondary_indexes(struct memtx_story *story)
+{
+	if (story == NULL)
+		return;
+
+	struct txn_stmt *stmt = story->add_stmt;
+	/* Обработка конфликтов во вторичных индексах. */
+	for (uint32_t i = 1; i < story->index_count; i++) {
+		/*
+		 * Обработка вторичных cross-write конфликтов. Этот случай
+		 * слишком сложен и заслуживает пояснения на примере.
+		 * Представим спейс с первичным ключом (pk) по первому полю
+		 * и вторичным индексом (sk) по второму полю.
+		 * Представим себе 3 in-progress транзакции, которые выполняют
+		 * реплейсы {1, 1, 1}, {2, 1, 2} и {1, 1, 3} соответственно.
+		 * Что должно произойти, когда первая транзакция коммитится?
+		 * Обе другие транзакции пересекаются с текущей во вторичном ключе.
+		 * Но вторая транзакция с {2, 1, 2} должна быть зааборчена
+		 * (или отправлена в read view) из-за конфликта: она вводит
+		 * дубликат по вторичному ключу.
+		 * С другой стороны третья транзакция с таплом {1, 1, 3} имеет
+		 * право на существование, т.к. перезаписывает {1, 1, 1}
+		 * в обоих - вторичном и первичном индексах.
+		 * Чтобы обработать эти конфликты, мы должны просканировать
+		 * цепочки в направлении верхушки и проверить все insert стейтменты.
+		 */
+		struct memtx_story *newer_story = story;
+		while (newer_story->link[i].newer_story != NULL) {
+			newer_story = newer_story->link[i].newer_story;
+			struct txn_stmt *test_stmt = newer_story->add_stmt;
+			/* Не конфликтуем с собственными изменениями. */
+			if (stmt != NULL && test_stmt->txn == stmt->txn)
+				continue;
+			assert(test_stmt->txn->psn == 0);
+			/* Вставка после удаления этой же транзакцией. */
+			if (newer_story->link[i].is_own_change &&
+			    test_stmt->del_story == NULL)
+				continue;
+			/*
+			 * По вторичному индексу транзакция перезаписала нашу story,
+			 * которую мы сейчас препейрим, но удалила другую. Пока не
+			 * понятно, почему мы не отправили сразу в read view. Видимо,
+			 * эта ситуация может меняться со временем.
+			 */
+			if (test_stmt->del_story == story)
+				continue;
+			txn_abort_with_conflict(test_stmt->txn);
+		}
+	}
+}
+
+/**
+ * Откатываем или отправляем в read view всех читателей @a story,
+ * за исключением транзакции @a writer, которая удалила данный story.
+ */
+static void
+memtx_tx_handle_conflict_gap_readers(struct memtx_story *top_story, uint32_t ind, struct txn *writer)
+{
+	assert(top_story->link[ind].newer_story == NULL);
+	struct gap_item_base *item, *tmp;
+	rlist_foreach_entry_safe(item, &top_story->link[ind].read_gaps, in_read_gaps, tmp) {
+		assert(item->txn != NULL);
+		if (item->txn == writer || item->type != GAP_INPLACE)
+			continue;
+		txn_send_to_read_view(item->txn, writer->psn);
+	}
+}
+
 static void
 memtx_tx_history_add_stmt_prepare_result(struct tuple *old_tuple, struct tuple **result)
 {
@@ -1321,6 +1395,68 @@ memtx_tx_history_add_stmt_prepare_result(struct tuple *old_tuple, struct tuple *
 	//if (*result != NULL) {
 	//	tuple_ref(*result);
 	//}
+}
+
+int
+memtx_tx_history_add_committed_tuple(struct memtx_space *space, uint32_t index_id, struct tuple *tuple)
+{
+	assert(tuple != NULL);
+	struct index *index = space->index[index_id];
+	struct tuple *replaced = NULL;
+
+	if (index_get_raw(index, tuple, &replaced) != 0)
+		return -1;
+
+	struct memtx_story *add_story = NULL;
+	if (tuple_has_flag(tuple, TUPLE_IS_DIRTY))
+		add_story = memtx_tx_story_get(tuple);
+	else
+		add_story = memtx_tx_story_new(space, tuple);
+
+	add_story->link[index_id].newer_story =
+		add_story->link[index_id].older_story = NULL;
+	add_story->link[index_id].in_index = NULL;
+	//assert(add_story->link[index_id].read_gaps.next == NULL);
+	//assert(add_story->link[index_id].read_gaps.prev == NULL);
+	rlist_create(&add_story->link[index_id].read_gaps);
+
+	struct memtx_story *top_story = NULL;
+	if (replaced != NULL) {
+		assert(tuple_has_flag(replaced, TUPLE_IS_DIRTY));
+		top_story = memtx_tx_story_get(tuple);
+		assert(top_story != NULL);
+
+		//assert(false);
+
+		struct memtx_story *bottom_story = top_story;
+		while (true) {
+			if (bottom_story->add_psn != 0 || bottom_story->add_stmt == NULL) {
+				return -1;
+			}
+			if (bottom_story->link[index_id].older_story == NULL)
+				break;
+			bottom_story = bottom_story->link[index_id].older_story;
+		}
+
+		assert(false);
+		assert(bottom_story != NULL);
+		//memtx_tx_story_link(bottom_story, add_story, index_id);
+		memtx_tx_handle_conflict_gap_readers(top_story, index_id, NULL);
+	} else {
+		struct tuple *unused;
+
+		if (index_replace(index, NULL, tuple, DUP_REPLACE_OR_INSERT, &replaced, &unused) != 0)
+		{
+			if (index_replace(index, tuple, NULL, DUP_INSERT, &unused, &unused) != 0) {
+				fprintf(stderr, "failed to rollback change\n");
+				exit(1);
+			}
+			return -1;
+		}
+		assert(replaced == NULL);
+		add_story->link[index_id].in_index = index;
+	}
+	return 0;
 }
 
 /**
@@ -1543,60 +1679,21 @@ memtx_tx_abort_story_readers(struct memtx_story *story)
 		txn_abort_with_conflict(tracker->reader);
 }
 
-/*
- * After the last prepared story in a chain is modified (either when another
- * story becomes last or when the del_psn of the last story becomes 0), some
- * subsequent transactions may become duplicates. This function aborts all
- * in-progress transactions that would lead to duplicates.
- */
+/* Абортим все транзакции, которые прочитали отсутствие @a story. */
 static void
-memtx_tx_handle_dups_in_secondary_indexes(struct memtx_story *story)
+memtx_tx_abort_gap_readers(struct memtx_story *story)
 {
-	if (story == NULL)
-		return;
-
-	struct txn_stmt *stmt = story->add_stmt;
-	/* Обработка конфликтов во вторичных индексах. */
-	for (uint32_t i = 1; i < story->index_count; i++) {
+	for (uint32_t i = 0; i < story->index_count; i++) {
 		/*
-		 * Обработка вторичных cross-write конфликтов. Этот случай
-		 * слишком сложен и заслуживает пояснения на примере.
-		 * Представим спейс с первичным ключом (pk) по первому полю
-		 * и вторичным индексом (sk) по второму полю.
-		 * Представим себе 3 in-progress транзакции, которые выполняют
-		 * реплейсы {1, 1, 1}, {2, 1, 2} и {1, 1, 3} соответственно.
-		 * Что должно произойти, когда первая транзакция коммитится?
-		 * Обе другие транзакции пересекаются с текущей во вторичном ключе.
-		 * Но вторая транзакция с {2, 1, 2} должна быть зааборчена
-		 * (или отправлена в read view) из-за конфликта: она вводит
-		 * дубликат по вторичному ключу.
-		 * С другой стороны третья транзакция с таплом {1, 1, 3} имеет
-		 * право на существование, т.к. перезаписывает {1, 1, 1}
-		 * в обоих - вторичном и первичном индексах.
-		 * Чтобы обработать эти конфликты, мы должны просканировать
-		 * цепочки в направлении верхушки и проверить все insert стейтменты.
+		 * Здесь мы опираемся на инвариант, что все gap трекеры храняться в самой
+		 * верхушке цепочки. Выше уже обсуждали наличие данного инварианта.
 		 */
-		struct memtx_story *newer_story = story;
-		while (newer_story->link[i].newer_story != NULL) {
-			newer_story = newer_story->link[i].newer_story;
-			struct txn_stmt *test_stmt = newer_story->add_stmt;
-			/* Не конфликтуем с собственными изменениями. */
-			if (stmt != NULL && test_stmt->txn == stmt->txn)
+		struct memtx_story *top = memtx_tx_story_find_top(story, i);
+		struct gap_item_base *item, *tmp;
+		rlist_foreach_entry_safe(item, &top->link[i].read_gaps, in_read_gaps, tmp) {
+			if (item->type != GAP_INPLACE)
 				continue;
-			assert(test_stmt->txn->psn == 0);
-			/* Вставка после удаления этой же транзакцией. */
-			if (newer_story->link[i].is_own_change &&
-			    test_stmt->del_story == NULL)
-				continue;
-			/*
-			 * По вторичному индексу транзакция перезаписала нашу story,
-			 * которую мы сейчас препейрим, но удалила другую. Пока не
-			 * понятно, почему мы не отправили сразу в read view. Видимо,
-			 * эта ситуация может меняться со временем.
-			 */
-			if (test_stmt->del_story == story)
-				continue;
-			txn_abort_with_conflict(test_stmt->txn);
+			txn_abort_with_conflict(item->txn);
 		}
 	}
 }
@@ -1665,6 +1762,10 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 			}
 		}
 
+		/* Транзакции, которые прочитали отсутствие этой story, должны быть зааборчены. */
+		if (del_story != NULL)
+			memtx_tx_abort_gap_readers(del_story);
+
 		memtx_tx_handle_dups_in_secondary_indexes(del_story);
 
 		/* Откатываем присвоение psn. */
@@ -1683,25 +1784,6 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 		memtx_tx_story_unlink_deleted_by(del_story, stmt);
 
 	add_story->del_psn = MEMTX_TX_ROLLBACKED_PSN; // psn = 1;
-}
-
-/* Абортим все транзакции, которые прочитали отсутствие @a story. */
-static void
-memtx_tx_abort_gap_readers(struct memtx_story *story)
-{
-	for (uint32_t i = 0; i < story->index_count; i++) {
-		/*
-		 * Здесь мы опираемся на инвариант, что все gap трекеры храняться в самой
-		 * верхушке цепочки. Выше уже обсуждали наличие данного инварианта.
-		 */
-		struct memtx_story *top = memtx_tx_story_find_top(story, i);
-		struct gap_item_base *item, *tmp;
-		rlist_foreach_entry_safe(item, &top->link[i].read_gaps, in_read_gaps, tmp) {
-			if (item->type != GAP_INPLACE)
-				continue;
-			txn_abort_with_conflict(item->txn);
-		}
-	}
 }
 
 /* Откатить удаление story данным стейтментом. */
@@ -1820,6 +1902,8 @@ memtx_tx_history_rollback_stmt(struct txn_stmt *stmt)
 	/*
 	 * Видимо memtx_tx_history_rollback_added_story обрабатывает и
 	 * удаление сразу??? Ну да, кажется, это правда.
+	 * 
+	 * А вот и нет, не обрабатывает. https://github.com/tarantool/tarantool/issues/11802
 	*/
 	if (stmt->add_story != NULL)
 		memtx_tx_history_rollback_added_story(stmt);
@@ -1842,22 +1926,6 @@ memtx_tx_handle_conflict_story_readers(struct memtx_story *story, struct txn *wr
 		if (tracker->reader == writer)
 			continue;
 		txn_send_to_read_view(tracker->reader, writer->psn);
-	}
-}
-
-/**
- * Откатываем или отправляем в read view всех читателей @a story,
- * за исключением транзакции @a writer, которая удалила данный story.
- */
-static void
-memtx_tx_handle_conflict_gap_readers(struct memtx_story *top_story, uint32_t ind, struct txn *writer)
-{
-	assert(top_story->link[ind].newer_story == NULL);
-	struct gap_item_base *item, *tmp;
-	rlist_foreach_entry_safe(item, &top_story->link[ind].read_gaps, in_read_gaps, tmp) {
-		if (item->txn == writer || item->type != GAP_INPLACE)
-			continue;
-		txn_send_to_read_view(item->txn, writer->psn);
 	}
 }
 
@@ -2514,7 +2582,7 @@ memtx_tx_track_gap_slow(struct txn *txn, struct memtx_space *space, struct index
 			story = memtx_tx_story_get(successor);
 		else
 			story = memtx_tx_story_new(space, successor);
-		assert(index->dense_id < story->index_count);
+		//assert(index->dense_id < story->index_count);
 		assert(story->link[index->dense_id].in_index != NULL);
 		rlist_add(&story->link[index->dense_id].read_gaps, &item->base.in_read_gaps);
 	} else {

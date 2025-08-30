@@ -60,7 +60,7 @@ memtx_space_execute_delete(struct memtx_space *space, struct txn *txn, uint32_t 
 	struct txn_stmt *stmt = txn_current_stmt(txn);
 	/* Try to find the tuple by unique key. */
 	assert(index_id < space->index_count);
-	struct index *pk = space->index[index_id];//index_find(space, index_id);
+	struct index *pk = space->index[index_id];
 	if (pk == NULL)
 		return -1;
 	struct tuple *old_tuple;
@@ -76,13 +76,35 @@ memtx_space_execute_delete(struct memtx_space *space, struct txn *txn, uint32_t 
 	return 0;
 }
 
+int
+memtx_space_create_index(struct memtx_space *space)
+{
+	if (space->index_count > BOX_INDEX_MAX)
+		return -1;
+
+	int dense_id = space->index_count++;
+	space->index[dense_id] = index_new();
+	space->index[dense_id]->space = space;
+	space->index[dense_id]->_key_def = dense_id;
+	space->index[dense_id]->dense_id = dense_id;
+	space->index[dense_id]->built = false;
+
+	if (memtx_space_build_index(space, space->index[dense_id]) != 0) {
+		--space->index_count;
+		//index_free(space->index[dense_id]);
+		space->index[dense_id] = NULL;
+		return -1;
+	}
+	space->index[dense_id]->built = true;
+	return 0;
+}
+
 struct memtx_space *
 memtx_space_new(uint32_t index_count)
 {
-	size_t size = sizeof(struct memtx_space) + sizeof(struct index) * index_count;
-	struct memtx_space *memtx_space = malloc(size);
+	struct memtx_space *memtx_space = malloc(sizeof(struct memtx_space));
 	if (memtx_space == NULL) {
-		fprintf(stderr, "Failed to allocate %u bytes in %s for %s\n", size, "malloc", "struct memtx_space");
+		fprintf(stderr, "Failed to allocate %u bytes in %s for %s\n", sizeof(struct memtx_space), "malloc", "struct memtx_space");
 		return NULL;
 	}
 	static uint32_t space_id = 0;
@@ -92,6 +114,7 @@ memtx_space_new(uint32_t index_count)
 		memtx_space->index[i]->space = memtx_space;
 		memtx_space->index[i]->_key_def = i;
 		memtx_space->index[i]->dense_id = i;
+		memtx_space->index[i]->built = true;
 	}
 	memtx_space->index_count = index_count;
 	return memtx_space;

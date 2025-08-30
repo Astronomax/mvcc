@@ -29,6 +29,9 @@ box_replace(struct memtx_space *space, struct tuple *new_tuple);
 int
 box_delete(struct memtx_space *space, uint32_t index_id, int key, struct tuple **result);
 
+int
+box_space_build_index(struct memtx_space *space);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

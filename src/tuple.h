@@ -3,8 +3,10 @@
 #include "assert.h"
 #include "stdbool.h"
 #include "stdint.h"
+
 #ifdef __cplusplus
 #include <vector>
+#include <string>
 #endif
 
 enum tuple_flag {
@@ -47,12 +49,6 @@ tuple_clear_flag(struct tuple *tuple, enum tuple_flag flag)
 }
 
 #ifdef __cplusplus
-extern "C" {
-#endif
-
-char *
-tuple_str(struct tuple *tuple);
-
-#ifdef __cplusplus
-} // extern "C"
+std::string
+tuple_str(const struct tuple *tuple);
 #endif

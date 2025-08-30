@@ -57,6 +57,9 @@ memtx_tx_abort_with_conflict(struct txn *txn);
 void
 memtx_tx_send_to_read_view(struct txn *txn, int64_t psn);
 
+int
+memtx_tx_history_add_committed_tuple(struct memtx_space *space, uint32_t index_id, struct tuple *tuple);
+
 /**
  * @brief Add a statement to transaction manager's history.
  * Until unlinking or releasing the space could internally contain

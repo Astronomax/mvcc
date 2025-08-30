@@ -1,6 +1,8 @@
 #pragma once
 
 #include "memtx_space.h"
+#include "wal.h"
+
 #include "fiber.h"
 #include "salad/stailq.h"
 #include "small/rlist.h"
@@ -45,6 +47,30 @@ enum {
 	 * special meaning that no real transaction can have.
 	 */
 	TXN_MIN_PSN = 2,
+};
+
+enum {
+	/** Signature set for empty transactions. */
+	TXN_SIGNATURE_NOP = 0,
+	/**
+	 * Aliases for journal errors to make all signature codes have the same
+	 * prefix.
+	 */
+	TXN_SIGNATURE_UNKNOWN = JOURNAL_ENTRY_ERR_UNKNOWN,
+	TXN_SIGNATURE_IO = JOURNAL_ENTRY_ERR_IO,
+	TXN_SIGNATURE_CASCADE = JOURNAL_ENTRY_ERR_CASCADE,
+	TXN_SIGNATURE_CANCELLED = JOURNAL_ENTRY_ERR_CANCELLED,
+	/**
+	 * The default signature value for failed transactions.
+	 * Indicates either write failure or any other failure
+	 * not caused by synchronous transaction processing.
+	 */
+	TXN_SIGNATURE_ROLLBACK = -101,
+	/**
+	 * Aborted before it could be written due an error which is already
+	 * installed into the global diag.
+	 */
+	TXN_SIGNATURE_ABORT = -104,
 };
 
 enum txn_status {
@@ -109,6 +135,10 @@ struct txn {
 	//enum txn_isolation_level isolation;
 	struct stailq stmts;
     unsigned flags;
+	/** LSN of this transaction when written to WAL. */
+	int64_t signature;
+	/* A fiber to wake up when transaction is finished. */
+	struct fiber *fiber;
 	struct txn_stmt *svp;
 	struct rlist in_read_view_txns;
 	struct rlist read_set;
@@ -254,6 +284,9 @@ txn_send_to_read_view(struct txn *txn, int64_t psn);
  */
 void
 txn_abort_with_conflict(struct txn *txn);
+
+struct journal_entry *
+txn_journal_entry_new(struct txn *txn);
 
 #ifdef __cplusplus
 } // extern "C"

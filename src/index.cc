@@ -34,7 +34,7 @@ index_check_dup(struct index *index, struct tuple *old_tuple, struct tuple *new_
              * Поэтому все вторичные ключи должны удалять то же самое, что первичный.
 			 * Мы не можем удалить более чем один тапл за раз.
 			 */
-			fprintf(stderr, "Duplicate key exists in unique index \"%s\" in space \"%s\" with old tuple - %s and new tuple - %s\n", "TODO", "TODO", tuple_str(dup_tuple), tuple_str(new_tuple));
+			fprintf(stderr, "Duplicate key exists in unique index \"%s\" in space \"%s\" with old tuple - %s and new tuple - %s\n", "TODO", "TODO", tuple_str(dup_tuple).c_str(), tuple_str(new_tuple).c_str());
 			goto fail;
 		}
 	}
@@ -42,6 +42,18 @@ index_check_dup(struct index *index, struct tuple *old_tuple, struct tuple *new_
 fail:
 	txn_set_flags(in_txn(), TXN_STMT_ROLLBACK);
 	return -1;
+}
+
+int
+index_get_raw(struct index *index, struct tuple *tuple, struct tuple **result)
+{
+	auto it = index->tree.find(tuple->data[index->dense_id]);
+	if (it == index->tree.end()) {
+		*result = NULL;
+		return 0;
+	}
+	*result = it->second;
+	return 0;
 }
 
 int
@@ -412,9 +424,7 @@ tree_iterator_start(struct iterator *iterator, struct tuple **ret)
 	 * contain key extracted with `cmp_def`, we should crop it by passing
 	 * `part_count` not greater than `key_def->part_count`.
 	 */
-	if (!key_is_full ||
-	    ((type == ITER_GE || type == ITER_LE) && !equals) ||
-	    (type == ITER_GT || type == ITER_LT))
+	if (!key_is_full || ((type == ITER_GE || type == ITER_LE) && !equals) || (type == ITER_GT || type == ITER_LT))
 		memtx_tx_track_gap(txn, space, index, successor, type, start_data);
 
 end:
@@ -426,6 +436,11 @@ end:
 struct iterator *
 index_create_iterator(struct index *index, enum iterator_type type, struct key_or_null key)
 {
+	if (index == NULL || !index->built) {
+		fprintf(stderr, "Index not built\n");
+		return NULL;
+	}
+
 	struct iterator *it = (struct iterator *)malloc(sizeof(struct iterator));
 	if (it == NULL) {
 		fprintf(stderr, "Failed to allocate %u bytes in %s for %s\n", sizeof(struct iterator), "memtx_tree_index", "iterator");
@@ -536,4 +551,49 @@ index_new()
 	rlist_create(&index->read_gaps);
 	new (&index->tree) std::map<int, struct tuple *>();
 	return index;
+}
+
+int
+memtx_space_build_index(struct memtx_space *src_space, struct index *new_index)
+{
+	assert(!new_index->built);
+
+	/* Abort all in progress transactions */
+	struct txn *txn;
+	//int cnt;
+	//do {
+	//	cnt = 0;
+		rlist_foreach_entry(txn, &txns, in_txns) {
+			if (txn == in_txn())
+				continue;
+			if (txn->status == TXN_INPROGRESS || txn->status == TXN_IN_READ_VIEW)
+				txn_abort_with_conflict(txn);
+	//		else
+	//			++cnt;
+		}
+	//	fiber_sleep(0);
+	//} while (cnt > 0);
+
+	/* Send to read_view */
+	txn_send_to_read_view(in_txn(), txn_next_psn);
+
+	struct index *pk = src_space->index[0];
+
+	struct iterator *it = index_create_iterator(pk, ITER_ALL, key_or_null{0, true});
+	assert (it != NULL);
+
+	int rc;
+	struct tuple *tuple;
+
+	int i = 0;
+	while ((rc = iterator_next_internal(it, &tuple)) == 0 && tuple != NULL) {
+		rc = memtx_tx_history_add_committed_tuple(src_space, new_index->dense_id, tuple);
+		if (rc != 0)
+			break;
+		//if (i % 20 == 0)
+			fiber_sleep(0);
+		++i;
+	}
+
+	return rc;
 }

@@ -142,6 +142,7 @@ set (sources
     src/memtx_space.c
     src/memtx_tx.c
     src/tuple.cc
+    src/wal.c
     src/txn.c
 )
 

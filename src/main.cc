@@ -5,6 +5,7 @@
 #include "box.h"
 #include "memtx_tx.h"
 #include "tuple.h"
+#include "wal.h"
 
 struct memtx_space *space;
 
@@ -72,6 +73,7 @@ int main() {
     memory_init();
     fiber_init(fiber_c_invoke);
     memtx_tx_manager_init();
+    wal_init();
 
     cord()->loop = ev_loop_new(EVFLAG_AUTO | EVFLAG_ALLOCFD);
     if (cord()->loop == NULL) {

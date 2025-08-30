@@ -12,6 +12,10 @@
 extern "C" {
 #endif
 
+enum {
+	BOX_INDEX_MAX = 128,
+};
+
 enum dup_replace_mode {
 	DUP_REPLACE_OR_INSERT,
 	DUP_INSERT,
@@ -35,6 +39,7 @@ struct index {
 	 * элемент был самым правым в индексе в момент вставки.
 	 */
 	struct rlist read_gaps;
+	bool built;
 #ifdef __cplusplus
 	std::map<int, struct tuple *> tree;
 #endif
@@ -73,6 +78,9 @@ int
 index_check_dup(struct index *index, struct tuple *old_tuple, struct tuple *new_tuple, struct tuple *dup_tuple, enum dup_replace_mode mode);
 
 int
+index_get_raw(struct index *index, struct tuple *tuple, struct tuple **result);
+
+int
 index_get_internal(struct index *index, int key, struct tuple **result);
 
 int
@@ -106,6 +114,9 @@ iterator_next_internal(struct iterator *it, struct tuple **ret);
 
 struct iterator *
 index_create_iterator(struct index *index, enum iterator_type type, struct key_or_null key);
+
+int
+memtx_space_build_index(struct memtx_space *src_space, struct index *new_index);
 
 struct index *
 index_new();
