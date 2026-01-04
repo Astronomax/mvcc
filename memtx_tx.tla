@@ -574,11 +574,11 @@ InsertReplace(txn, space, tuple, tuple_id, mode) ==
         duplicate_tuple == dup_result.duplicate_tuple
         is_own_change == dup_result.is_own_change
     IN
+    /\ allStmts' = allStmts \cup {nextStmtId}
+    /\ nextStmtId' = nextStmtId + 1
+    /\ txns' = TxnAddStmt(txns, txn, nextStmtId)
     /\ IF ~is_duplicate
        THEN \* No duplicate - proceed with insertion/replacement
-            /\ allStmts' = allStmts \cup {nextStmtId}
-            /\ nextStmtId' = nextStmtId + 1
-            /\ txns' = TxnAddStmt(txns, txn, nextStmtId)
             /\ stmts' = CreateStmt(stmts, nextStmtId, txn, space, nextStoryId, primary_visible_story, is_own_change[1])
             /\ allStories' = allStories \cup {nextStoryId}
             /\ nextStoryId' = nextStoryId + 1
@@ -607,13 +607,12 @@ InsertReplace(txn, space, tuple, tuple_id, mode) ==
             \* Clear point holes for all indexes
             /\ pointHoles' = ClearPointHoles(pointHoles, space, tuple, directly_replaced)
        ELSE \* Duplicate found - track read for duplicate tuple
+            /\ stmts' = CreateStmt(stmts, nextStmtId, txn, space, NULL, NULL, FALSE)
             /\ IF duplicate_tuple # NULL
                THEN LET duplicate_story == history[duplicate_tuple]
                     IN readTrackers' = AddReadTracker(readTrackers, stories, duplicate_story, txn)
-               ELSE readTrackers' = readTrackers
-            /\ stories' = stories
-            /\ gapTrackers' = gapTrackers
-            /\ UNCHANGED <<allStories, nextStoryId, allStmts, nextStmtId, history, stmts, storyChains, indexState, txns, pointHoles>>
+               ELSE UNCHANGED <<readTrackers>>
+            /\ UNCHANGED <<allStories, stories, gapTrackers, nextStoryId, history, stmts, storyChains, indexState, pointHoles>>
     /\ UNCHANGED <<nextPSN, nextTxnId, allTxns, spaceIndexes>>
 
 Get(txn, index, key) ==
@@ -622,38 +621,101 @@ Get(txn, index, key) ==
     /\ key \in Key
     /\ LET tuple == IndexGetTuple(index, key)
            visible_result == FindVisibleTuple(txn, index, key, tuple)
+           \* Find space that contains this index
+           space == CHOOSE s \in Space : index \in {spaceIndexes[s][i] : i \in DOMAIN spaceIndexes[s]}
        IN
-       IF visible_result.visible_tuple # NULL
-       THEN \* Found visible tuple - track read
-            LET visible_story == history[visible_result.visible_tuple]
-            IN readTrackers' = AddReadTracker(readTrackers, stories, visible_story, txn)
-            /\ pointHoles' = pointHoles
-            /\ stories' = stories
-            /\ gapTrackers' = gapTrackers
-       ELSE \* Nothing found - create point hole
-            pointHoles' = [pointHoles EXCEPT
-                          ![index][key] = pointHoles[index][key] \cup {txn}]
-            /\ stories' = stories
-            /\ gapTrackers' = gapTrackers
-            /\ readTrackers' = readTrackers
+       IF ~visible_result.is_own_change
+       THEN IF visible_result.visible_tuple # NULL
+            THEN \* Found visible tuple - track read
+                 LET visible_story == history[visible_result.visible_tuple]
+                 IN /\ readTrackers' = AddReadTracker(readTrackers, stories, visible_story, txn)
+                    /\ UNCHANGED <<pointHoles, stories, gapTrackers>>
+            ELSE \* Nothing visible found
+                 IF tuple # NULL
+                 THEN \* Track gap for top_story
+                      LET top_story == history[tuple]
+                          indexes == spaceIndexes[space]
+                          index_pos == CHOOSE i \in DOMAIN indexes : indexes[i] = index
+                      IN /\ UNCHANGED <<pointHoles, stories, readTrackers>>
+                         /\ gapTrackers' = AddGapTracker(gapTrackers, top_story, index_pos, txn)
+                 ELSE \* tuple = NULL - track point hole
+                      /\ pointHoles' = [pointHoles EXCEPT
+                                      ![index][key] = pointHoles[index][key] \cup {txn}]
+                      /\ UNCHANGED <<stories, gapTrackers, readTrackers>>
+       ELSE \* Own change - no tracking
+            /\ UNCHANGED <<pointHoles, stories, gapTrackers, readTrackers>>
     /\ UNCHANGED <<txns, storyChains, stmts, indexState, tuples, history,
                   nextTxnId, nextStmtId, nextStoryId, nextTupleId, nextPSN,
                   allStories, allTxns, allStmts, spaceIndexes>>
 
+\* Action: Delete operation
+Delete(txn, space, index, key) ==
+    /\ IsInProgress(txn)
+    /\ space \in Space
+    /\ index \in Index
+    /\ key \in Key
+    /\ index \in {spaceIndexes[space][i] : i \in DOMAIN spaceIndexes[space]}
+    /\ LET tuple == IndexGetTuple(index, key)
+           visible_result == FindVisibleTuple(txn, index, key, tuple)
+       IN /\ allStmts' = allStmts \cup {nextStmtId}
+          /\ nextStmtId' = nextStmtId + 1
+          /\ txns' = TxnAddStmt(txns, txn, nextStmtId)
+          /\ IF visible_result.visible_tuple # NULL
+             THEN \* Found visible tuple - delete it
+                  LET visible_story == history[visible_result.visible_tuple]
+                      \* Determine is_own_change: TRUE if this transaction inserted the story
+                      is_own_change ==
+                          IF visible_story # NULL /\
+                             stories[visible_story].add_stmt # NULL
+                          THEN stmts[stories[visible_story].add_stmt].txn = txn
+                          ELSE FALSE
+                  IN /\ stmts' = CreateStmt(stmts, nextStmtId, txn, space, NULL, visible_story, is_own_change)
+                     /\ stories' = StoryLinkDeletedBy(stories, visible_story, nextStmtId)
+                     /\ IF ~visible_result.is_own_change
+                        THEN readTrackers' = AddReadTracker(readTrackers, stories, visible_story, txn)
+                        ELSE UNCHANGED <<readTrackers>>
+                     /\ UNCHANGED <<gapTrackers, pointHoles>>
+             ELSE \* Nothing visible found - still create statement
+                  /\ stmts' = CreateStmt(stmts, nextStmtId, txn, space, NULL, NULL, FALSE)
+            /\ UNCHANGED <<stories, readTrackers>>
+            /\ IF ~visible_result.is_own_change
+               THEN IF tuple # NULL /\ tuple \in DOMAIN history /\ history[tuple] # NULL
+                    THEN \* Track gap for top_story
+                         LET top_story == history[tuple]
+                             indexes == spaceIndexes[space]
+                             index_pos == CHOOSE i \in DOMAIN indexes : indexes[i] = index
+                         IN /\ gapTrackers' = AddGapTracker(gapTrackers, top_story, index_pos, txn)
+                            /\ UNCHANGED <<pointHoles>>
+                    ELSE \* tuple = NULL - track point hole
+                         /\ UNCHANGED <<gapTrackers>>
+                         /\ pointHoles' = [pointHoles EXCEPT
+                                         ![index][key] = pointHoles[index][key] \cup {txn}]
+               ELSE \* Own change - no tracking
+                    /\ UNCHANGED <<gapTrackers, pointHoles>>
+    /\ UNCHANGED <<storyChains, indexState, tuples, history,
+                  nextTxnId, nextStoryId, nextTupleId, nextPSN,
+                  allStories, allTxns, spaceIndexes>>
+
 \* Next state relation
 Next ==
     \/ BeginTxn
-    \/ \E txn \in allTxns, space \in Space, keys \in UNION {[1..i -> Key] : i \in 1..MaxIndexesPerSpace}, mode \in {"INSERT", "REPLACE"} :
-       LET tuple == [keys |-> keys]
-           new_tuple_id == nextTupleId
-       IN /\ nextTupleId' = nextTupleId + 1
-          /\ tuples' = [tuples EXCEPT ![new_tuple_id] = tuple]
-          /\ InsertReplace(txn, space, tuple, new_tuple_id, mode)
+    \/ \E txn \in allTxns,
+          space \in Space,
+          keys \in UNION {[1..i -> Key] : i \in 1..MaxIndexesPerSpace},
+          mode \in {"INSERT", "REPLACE"} :
+       /\ IsInProgress(txn)
+       /\ LET tuple == [keys |-> keys]
+             new_tuple_id == nextTupleId
+          IN /\ nextTupleId' = nextTupleId + 1
+             /\ tuples' = [tuples EXCEPT ![new_tuple_id] = tuple]
+             /\ InsertReplace(txn, space, tuple, new_tuple_id, mode)
     \/ \E txn \in allTxns, index \in Index, key \in Key :
-       Get(txn, index, key)
+       /\ IsInProgress(txn)
+       /\ Get(txn, index, key)
+    \/ \E txn \in allTxns, space \in Space, index \in Index, key \in Key :
+       /\ IsInProgress(txn)
+       /\ Delete(txn, space, index, key)
     \* TODO: Add other actions when implemented
-    \* \/ \E txn \in allTxns, space \in Space, index \in Index, key \in Key :
-    \*    Delete(txn, space, index, key)
     \* \/ \E txn \in allTxns : PrepareTxn(txn)
     \* \/ \E txn \in allTxns : CommitTxn(txn)
     \* \/ \E txn \in allTxns : RollbackTxn(txn)
