@@ -33,7 +33,8 @@
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS MaxTxn, MaxStmt, MaxSpace, MaxKey, MaxIndex, MaxPSN, MaxIndexesPerSpace
+\* User-facing bounds (only these are provided via .cfg):
+CONSTANTS MaxSpace, MaxIndexesPerSpace, MaxTxn, MaxStmtPerTxn, MaxKey
 
 VARIABLES 
     \* Transaction state - now a map from txn to record
@@ -41,6 +42,7 @@ VARIABLES
 
     \* Space configuration: which indexes belong to each space
     spaceIndexes,   \* [space -> sequence of Index] - indexes for each space (first is primary)
+    spaceIndexCount,\* [space -> 1..MaxIndexesPerSpace] - active index count for each space
     
     \* Story chains: for each (index, key) we maintain a chain of stories
     \* Each story represents a version of a tuple with that key
@@ -84,14 +86,22 @@ VARIABLES
 \* Helper sets
 Txn == 1..MaxTxn
 Key == 1..MaxKey
+MaxIndex == MaxSpace * MaxIndexesPerSpace
 Index == 1..MaxIndex
 Space == 1..MaxSpace
 \* Story and Stmt are just natural numbers - we'll use a large enough range
-Story == 1..(MaxTxn * MaxStmt)
-Tuple == 1..(MaxTxn * MaxStmt)
-Stmt == 1..(MaxTxn * MaxStmt)
+MaxStmt == MaxTxn * MaxStmtPerTxn
+MaxPSN == MaxTxn + 2
+Story == 1..MaxStmt
+Tuple == 1..MaxStmt
+Stmt == 1..MaxStmt
 NULL == 0
 ROLLBACKED_PSN == 1
+
+\* Deterministic mapping: the i-th index of space s (1-based).
+\* This ensures: each space has up to MaxIndexesPerSpace indexes and
+\* no index belongs to more than one space.
+IndexId(s, i) == (s - 1) * MaxIndexesPerSpace + i
 
 \* States
 INPROGRESS == 1
@@ -135,28 +145,29 @@ TupleType == [
 ]
 
 \* Helper functions
-IsInProgress(txn) == txn \in DOMAIN txns /\ txns[txn].status = INPROGRESS
-IsPrepared(txn) == txn \in DOMAIN txns /\ txns[txn].status = PREPARED /\ txns[txn].psn # 0
-IsInReadView(txn) == txn \in DOMAIN txns /\ txns[txn].status = IN_READ_VIEW /\ txns[txn].rv_psn # 0
-IsCommitted(txn) == txn \in DOMAIN txns /\ txns[txn].status = COMMITTED
-IsAborted(txn) == txn \in DOMAIN txns /\ txns[txn].status = ABORTED
+\* NOTE: txns/stmts/stories are modeled as total functions; existence is tracked by allTxns/allStmts/allStories.
+IsInProgress(txn) == txn \in allTxns /\ txns[txn].status = INPROGRESS
+IsPrepared(txn) == txn \in allTxns /\ txns[txn].status = PREPARED /\ txns[txn].psn # 0
+IsInReadView(txn) == txn \in allTxns /\ txns[txn].status = IN_READ_VIEW /\ txns[txn].rv_psn # 0
+IsCommitted(txn) == txn \in allTxns /\ txns[txn].status = COMMITTED
+IsAborted(txn) == txn \in allTxns /\ txns[txn].status = ABORTED
 
 IsInProgressStory(story) == 
-    story \in DOMAIN stories /\ stories[story].add_psn = 0 /\
+    story \in allStories /\ stories[story].add_psn = 0 /\
     stories[story].add_stmt # NULL
 
 IsPreparedStory(story) ==
-    story \in DOMAIN stories /\ stories[story].add_psn # 0 /\
+    story \in allStories /\ stories[story].add_psn # 0 /\
     stories[story].add_stmt # NULL
 
 \* Let's assume that the rolled back one is also committed
 \* provided that there is a committed dummy "delete" statement
 \* (del_psn = ROLLBACKED_PSN)
 IsCommittedStory(story) ==
-    story \in DOMAIN stories /\ stories[story].add_stmt = NULL
+    story \in allStories /\ stories[story].add_stmt = NULL
 
 IsRolledBackStory(story) ==
-    story \in DOMAIN stories /\ stories[story].del_psn # ROLLBACKED_PSN
+    story \in allStories /\ stories[story].del_psn # ROLLBACKED_PSN
 
 IsPreparedOrCommittedStory(story) == ~IsInProgressStory(story)
 
@@ -223,22 +234,31 @@ Property3 ==
                   stmts[stories[next].add_stmt].del_story \in {NULL, prev})
             ELSE TRUE
 
-\* Property 4: For each story that is not the last in any chain, gapTrackers must be empty
+\* Property 4: For each story and each index-position i of its space:
+\* if the story is not the last in the corresponding chain (for the i-th index),
+\* then it must have no gap trackers for that index-position: gapTrackers[story][i] = {}.
 Property4 ==
     \A story \in allStories:
-        LET is_last_in_some_chain ==
-            \E index \in Index, key \in Key:
-                LET chain == storyChains[index][key]
-                    chain_len == Len(chain)
-                IN index \in DOMAIN storyChains /\
-                   key \in DOMAIN storyChains[index] /\
-                   chain_len > 0 /\
-                   chain[chain_len] = story
-        IN IF ~is_last_in_some_chain
-           THEN \* Story is not last in any chain - gapTrackers must be empty
-                (story \notin DOMAIN gapTrackers) \/
-                (\A i \in DOMAIN gapTrackers[story]: gapTrackers[story][i] = {})
-           ELSE TRUE
+        IF stories[story].add_stmt = NULL
+        THEN \A i \in 1..MaxIndexesPerSpace: gapTrackers[story][i] = {}
+        ELSE
+            LET stmt_id == stories[story].add_stmt
+            IN IF stmt_id \notin Stmt
+            THEN \A i \in 1..MaxIndexesPerSpace: gapTrackers[story][i] = {}
+            ELSE
+            LET space == stmts[stmt_id].space
+                indexes == spaceIndexes[space]
+                tuple_id == stories[story].tuple
+            IN \A i \in 1..MaxIndexesPerSpace:
+                IF i > spaceIndexCount[space]
+                THEN gapTrackers[story][i] = {}
+                ELSE
+                    LET idx == indexes[i]
+                        key == tuples[tuple_id].keys[i]
+                        chain == storyChains[idx][key]
+                    IN IF Len(chain) = 0 \/ chain[Len(chain)] # story
+                       THEN gapTrackers[story][i] = {}
+                       ELSE TRUE
 
 Invariants ==
     /\ Property0
@@ -312,6 +332,11 @@ FindVisibleTuple(txn, index, key, tuple) ==
 \* Index.
 --------------------------------------------------------------------------------
 
+\* Inverse helpers for IndexId (work for the disjoint-block layout).
+SpaceOfIndex(idx) == ((idx - 1) \div MaxIndexesPerSpace) + 1
+
+PosInSpace(idx) == ((idx - 1) % MaxIndexesPerSpace) + 1
+
 \* Get tuple from index (returns NULL if not found)
 IndexGetTuple(index, key) ==
     IF index \in DOMAIN indexState /\ key \in DOMAIN indexState[index]
@@ -322,8 +347,8 @@ IndexGetTuple(index, key) ==
 IndexReplace(index_state_map, space, tuple, tuple_id) ==
     LET indexes == spaceIndexes[space]
     IN [idx \in Index |->
-        IF idx \in {indexes[i] : i \in DOMAIN indexes}
-        THEN LET idx_pos == CHOOSE i \in DOMAIN indexes : indexes[i] = idx
+        IF idx \in {indexes[i] : i \in 1..spaceIndexCount[space]}
+        THEN LET idx_pos == PosInSpace(idx)
                  key == tuple.keys[idx_pos]
              IN [index_state_map[idx] EXCEPT ![key] = tuple_id]
         ELSE index_state_map[idx]]
@@ -386,39 +411,34 @@ AddReadTracker(read_trackers_map, stories_map, story_id, txn) ==
          read_trackers_map[story_id] \cup {txn}]
     ELSE read_trackers_map
 
-\* Initialize and populate gap trackers for new story
-\* For each index i:
-\*   - If directly_replaced_stories[i] # NULL:
-\*          copy from replaced story's gap trackers
-\*   - If directly_replaced_stories[i] = NULL (<=> directly_replaced[i] = NULL):
-\*          copy from point holes (inserting into gap)
-InitGapTrackersForNewStory(gap_trackers_map, space, tuple, directly_replaced_stories) ==
+\* Move gap trackers during INSERT/REPLACE:
+\* 1) Populate gapTrackers[nextStoryId][i] from either replaced story's gap trackers or pointHoles.
+\*    For each index i:
+\*      - If directly_replaced_stories[i] # NULL:
+\*             copy from replaced story's gap trackers
+\*      - If directly_replaced_stories[i] = NULL (<=> directly_replaced[i] = NULL):
+\*             copy from point holes (inserting into gap)
+\* 2) Clear gap trackers on directly replaced stories for their corresponding index-positions.
+MoveGapTrackersOnInsertReplace(gap_trackers_map, space, tuple, directly_replaced_stories) ==
     LET indexes == spaceIndexes[space]
-    IN [gap_trackers_map EXCEPT ![nextStoryId] = 
-        [i \in 1..Len(indexes) |->
-         LET idx == indexes[i]
-             key == tuple.keys[i]
-         IN IF directly_replaced_stories[i] # NULL
-            THEN \* Copy from replaced story's gap trackers
-                 gap_trackers_map[nextStoryId][i] \cup gap_trackers_map[directly_replaced_stories[i]][i]
-            ELSE IF idx \in DOMAIN pointHoles /\
-                    key \in DOMAIN pointHoles[idx]
-                 THEN \* Copy from point holes (inserting into gap)
-                      gap_trackers_map[nextStoryId][i] \cup pointHoles[idx][key]
-                 ELSE \* Keep existing gap trackers
-                      gap_trackers_map[nextStoryId][i]]]
-
-\* Clear gap trackers from replaced stories for corresponding indexes
-\* For each replaced story, clear gap trackers for all indexes where it was replaced
-ClearGapTrackers(gap_trackers_map, directly_replaced_stories) ==
-    [s \in DOMAIN gap_trackers_map |->
-        IF \E i \in 1..Len(directly_replaced_stories) :
-            directly_replaced_stories[i] = s
-        THEN [i \in 1..Len(directly_replaced_stories) |->
-                IF directly_replaced_stories[i] = s
-                THEN {}
-                ELSE gap_trackers_map[s][i]]
-        ELSE gap_trackers_map[s]]
+    IN \* Build final map in one pass (similar style to MoveGapTrackersOnPrepare)
+       [s \in Story |->
+          [i \in 1..MaxIndexesPerSpace |->
+             IF i <= Len(directly_replaced_stories) /\ directly_replaced_stories[i] = s
+             THEN {} \* cleared at source
+             ELSE IF s = nextStoryId
+                  THEN
+                      IF i > spaceIndexCount[space]
+                      THEN gap_trackers_map[nextStoryId][i]
+                      ELSE
+                          LET idx == indexes[i]
+                              key == tuple.keys[i]
+                          IN IF directly_replaced_stories[i] # NULL
+                             THEN gap_trackers_map[nextStoryId][i] \cup gap_trackers_map[directly_replaced_stories[i]][i]
+                             ELSE IF idx \in DOMAIN pointHoles /\ key \in DOMAIN pointHoles[idx]
+                                  THEN gap_trackers_map[nextStoryId][i] \cup pointHoles[idx][key]
+                                  ELSE gap_trackers_map[nextStoryId][i]
+                  ELSE gap_trackers_map[s][i]]]
 
 --------------------------------------------------------------------------------
 \* Chain.
@@ -428,8 +448,8 @@ ClearGapTrackers(gap_trackers_map, directly_replaced_stories) ==
 StoryChainAppendNewStory(story_chains_map, space, tuple) ==
     LET indexes == spaceIndexes[space]
     IN [idx \in Index |->
-        IF \E i \in DOMAIN indexes : indexes[i] = idx
-        THEN LET i == CHOOSE pos \in DOMAIN indexes : indexes[pos] = idx
+        IF \E i \in 1..spaceIndexCount[space] : indexes[i] = idx
+        THEN LET i == PosInSpace(idx)
              IN [story_chains_map[idx] EXCEPT ![tuple.keys[i]] =
                 Append(story_chains_map[idx][tuple.keys[i]], nextStoryId)]
         ELSE story_chains_map[idx]]
@@ -443,8 +463,8 @@ StoryChainAppendNewStory(story_chains_map, space, tuple) ==
 ClearPointHoles(point_holes_map, space, tuple, directly_replaced) ==
     LET indexes == spaceIndexes[space]
     IN [idx \in Index |->
-        IF idx \in {indexes[i] : i \in DOMAIN indexes}
-        THEN LET idx_pos == CHOOSE i \in DOMAIN indexes : indexes[i] = idx
+        IF idx \in {indexes[i] : i \in 1..spaceIndexCount[space]}
+        THEN LET idx_pos == PosInSpace(idx)
                  key == tuple.keys[idx_pos]
              IN IF directly_replaced[idx_pos] = NULL
                 THEN [point_holes_map[idx] EXCEPT ![key] = {}]
@@ -459,11 +479,11 @@ CheckDup(txn, space, directly_replaced, tuple_keys, mode) ==
         indexes == spaceIndexes[space]
         \* Find visible tuple for all indexes - compute once and reuse
         visible_results ==
-            [i \in 1..Len(indexes) |->
+            [i \in 1..spaceIndexCount[space] |->
                 FindVisibleTuple(txn, indexes[i], tuple_keys[i], directly_replaced[i])]
         \* Extract visible tuples and is_own_change arrays
-        visible_tuples == [i \in 1..Len(indexes) |-> visible_results[i].visible_tuple]
-        is_own_change == [i \in 1..Len(indexes) |-> visible_results[i].is_own_change]
+        visible_tuples == [i \in 1..spaceIndexCount[space] |-> visible_results[i].visible_tuple]
+        is_own_change == [i \in 1..spaceIndexCount[space] |-> visible_results[i].is_own_change]
         primary_visible_tuple == visible_tuples[1]
         \* Check for duplicates on primary key
         primary_is_duplicate ==
@@ -476,14 +496,14 @@ CheckDup(txn, space, directly_replaced, tuple_keys, mode) ==
         \* If secondary index shows a different tuple than primary, it's a duplicate error
         \* Find first secondary index with duplicate
         secondary_duplicate_tuple ==
-            LET CheckSecondary[i \in 2..Len(indexes)] ==
+            LET CheckSecondary[i \in 2..spaceIndexCount[space]] ==
                 LET sec_visible == visible_tuples[i]
                 IN IF sec_visible # NULL /\ sec_visible # primary_visible_tuple
                     THEN sec_visible
-                    ELSE IF i = Len(indexes)
+                    ELSE IF i = spaceIndexCount[space]
                         THEN NULL
                         ELSE CheckSecondary[i + 1]
-            IN IF Len(indexes) >= 2 THEN CheckSecondary[2] ELSE NULL
+            IN IF spaceIndexCount[space] >= 2 THEN CheckSecondary[2] ELSE NULL
         is_duplicate == primary_is_duplicate \/ secondary_duplicate_tuple # NULL
         duplicate_tuple ==
             IF primary_is_duplicate THEN primary_visible_tuple
@@ -496,6 +516,7 @@ CheckDup(txn, space, directly_replaced, tuple_keys, mode) ==
 
 \* Initial state
 Init ==
+    \* MaxIndex is derived as MaxSpace * MaxIndexesPerSpace.
     /\ allStories = {}
     /\ allTxns = {}
     /\ allStmts = {}
@@ -503,14 +524,17 @@ Init ==
     /\ nextStmtId = 1
     /\ nextStoryId = 1
     /\ nextTupleId = 1
-    /\ txns = [t \in allTxns |->
+    /\ txns = [t \in Txn |->
                [status |-> INPROGRESS,
                 psn |-> 0,
                 rv_psn |-> 0,
                 stmts |-> <<>>]]
-    /\ spaceIndexes = [s \in Space |-> <<s>>]  \* Each space has at least primary index (same as space number)
+    \* Each space owns a disjoint block of MaxIndexesPerSpace indexes.
+    /\ spaceIndexes = [s \in Space |-> [i \in 1..MaxIndexesPerSpace |-> IndexId(s, i)]]
+    \* Each space has a nondeterministic active index count in 1..MaxIndexesPerSpace.
+    /\ spaceIndexCount \in [Space -> 1..MaxIndexesPerSpace]
     /\ storyChains = [i \in Index |-> [k \in Key |-> <<>>]]
-    /\ stories = [s \in allStories |->
+    /\ stories = [s \in Story |->
                   [add_stmt |-> NULL,
                    add_psn |-> 0,
                    del_stmts |-> {},
@@ -519,9 +543,11 @@ Init ==
                    in_index |-> NULL,
                    index |-> NULL,
                    is_own_change |-> <<>>]]
-    /\ gapTrackers = [s \in allStories |-> <<>>]
-    /\ readTrackers = [s \in allStories |-> {}]
-    /\ stmts = [s \in allStmts |->
+    \* IMPORTANT: gapTrackers/readTrackers must be total over Story, otherwise EXCEPT updates
+    \* won't add entries for newly created stories and invariants like Property4 won't be exercised.
+    /\ gapTrackers = [s \in Story |-> [i \in 1..MaxIndexesPerSpace |-> {}]]
+    /\ readTrackers = [s \in Story |-> {}]
+    /\ stmts = [s \in Stmt |->
                 [txn |-> NULL,
                  space |-> NULL,
                  add_story |-> NULL,
@@ -536,7 +562,8 @@ Init ==
 
 BeginTxn ==
     /\ LET new_txn == nextTxnId
-       IN /\ new_txn \notin allTxns
+       IN /\ new_txn \in Txn
+          /\ new_txn \notin allTxns
           /\ txns' = [txns EXCEPT ![new_txn] =
                       [status |-> INPROGRESS,
                        psn |-> 0,
@@ -546,7 +573,7 @@ BeginTxn ==
           /\ nextTxnId' = nextTxnId + 1
           /\ UNCHANGED <<storyChains, stories, stmts,
                         indexState, tuples, history, nextPSN, nextStmtId, nextStoryId, nextTupleId, allStories, allStmts,
-                        pointHoles, spaceIndexes, gapTrackers, readTrackers>>
+                        pointHoles, spaceIndexes, spaceIndexCount, gapTrackers, readTrackers>>
 
 InsertReplace(txn, space, tuple, tuple_id, mode) ==
     LET
@@ -556,7 +583,7 @@ InsertReplace(txn, space, tuple, tuple_id, mode) ==
         key == tuple.keys[1]
         \* Build directly_replaced sequence: tuple replaced in each index by corresponding key
         directly_replaced ==
-            [i \in 1..Len(indexes) |->
+            [i \in 1..spaceIndexCount[space] |->
                 IndexGetTuple(indexes[i], tuple.keys[i])]
         directly_replaced_stories ==
             [i \in 1..Len(directly_replaced) |->
@@ -574,6 +601,8 @@ InsertReplace(txn, space, tuple, tuple_id, mode) ==
         duplicate_tuple == dup_result.duplicate_tuple
         is_own_change == dup_result.is_own_change
     IN
+    /\ nextStmtId \in Stmt
+    /\ nextStoryId \in Story
     /\ allStmts' = allStmts \cup {nextStmtId}
     /\ nextStmtId' = nextStmtId + 1
     /\ txns' = TxnAddStmt(txns, txn, nextStmtId)
@@ -587,16 +616,15 @@ InsertReplace(txn, space, tuple, tuple_id, mode) ==
                IN stories' = StoryLinkDeletedBy(created_story, primary_visible_story, nextStmtId)
             \* Initialize gap trackers for new story
             /\ LET gap_trackers_init == 
-                   [i \in 1..Len(indexes) |->
-                    IF i = 1 /\ ~is_own_change[1] /\ mode = "INSERT"
+                   \* IMPORTANT: keep gapTrackers[nextStoryId] total over 1..MaxIndexesPerSpace
+                   [i \in 1..MaxIndexesPerSpace |->
+                    IF i <= spaceIndexCount[space] /\ i = 1 /\ ~is_own_change[1] /\ mode = "INSERT"
                     THEN {txn}  \* Track gap for new story (inserting into gap)
                     ELSE {}]
                    gap_trackers_with_new == [gapTrackers EXCEPT ![nextStoryId] = gap_trackers_init]
-                   \* Initialize and populate gap trackers (copy from replaced stories or point holes)
-                   initialized_gap_trackers == InitGapTrackersForNewStory(gap_trackers_with_new, space, tuple, directly_replaced_stories)
-                   \* Clear gap trackers from replaced stories
-                   cleared_gap_trackers == ClearGapTrackers(initialized_gap_trackers, directly_replaced_stories)
-               IN gapTrackers' = cleared_gap_trackers
+                   \* Populate new story trackers and clear replaced stories in one step
+                   moved_gap_trackers == MoveGapTrackersOnInsertReplace(gap_trackers_with_new, space, tuple, directly_replaced_stories)
+               IN gapTrackers' = moved_gap_trackers
             \* Initialize read trackers for new story
             /\ readTrackers' = [readTrackers EXCEPT ![nextStoryId] = {}]
             /\ history' = [history EXCEPT ![tuple_id] = nextStoryId]
@@ -612,8 +640,8 @@ InsertReplace(txn, space, tuple, tuple_id, mode) ==
                THEN LET duplicate_story == history[duplicate_tuple]
                     IN readTrackers' = AddReadTracker(readTrackers, stories, duplicate_story, txn)
                ELSE UNCHANGED <<readTrackers>>
-            /\ UNCHANGED <<allStories, stories, gapTrackers, nextStoryId, history, stmts, storyChains, indexState, pointHoles>>
-    /\ UNCHANGED <<nextPSN, nextTxnId, allTxns, spaceIndexes>>
+            /\ UNCHANGED <<allStories, stories, gapTrackers, nextStoryId, history, storyChains, indexState, pointHoles>>
+    /\ UNCHANGED <<nextPSN, nextTxnId, allTxns, spaceIndexes, spaceIndexCount>>
 
 Get(txn, index, key) ==
     /\ IsInProgress(txn) \/ IsInReadView(txn)
@@ -621,8 +649,8 @@ Get(txn, index, key) ==
     /\ key \in Key
     /\ LET tuple == IndexGetTuple(index, key)
            visible_result == FindVisibleTuple(txn, index, key, tuple)
-           \* Find space that contains this index
-           space == CHOOSE s \in Space : index \in {spaceIndexes[s][i] : i \in DOMAIN spaceIndexes[s]}
+           \* Find space that contains this index (disjoint-block layout)
+           space == SpaceOfIndex(index)
        IN
        IF ~visible_result.is_own_change
        THEN IF visible_result.visible_tuple # NULL
@@ -634,8 +662,7 @@ Get(txn, index, key) ==
                  IF tuple # NULL
                  THEN \* Track gap for top_story
                       LET top_story == history[tuple]
-                          indexes == spaceIndexes[space]
-                          index_pos == CHOOSE i \in DOMAIN indexes : indexes[i] = index
+                          index_pos == PosInSpace(index)
                       IN /\ UNCHANGED <<pointHoles, stories, readTrackers>>
                          /\ gapTrackers' = AddGapTracker(gapTrackers, top_story, index_pos, txn)
                  ELSE \* tuple = NULL - track point hole
@@ -646,15 +673,16 @@ Get(txn, index, key) ==
             /\ UNCHANGED <<pointHoles, stories, gapTrackers, readTrackers>>
     /\ UNCHANGED <<txns, storyChains, stmts, indexState, tuples, history,
                   nextTxnId, nextStmtId, nextStoryId, nextTupleId, nextPSN,
-                  allStories, allTxns, allStmts, spaceIndexes>>
+                  allStories, allTxns, allStmts, spaceIndexes, spaceIndexCount>>
 
 \* Action: Delete operation
 Delete(txn, space, index, key) ==
     /\ IsInProgress(txn)
+    /\ nextStmtId \in Stmt
     /\ space \in Space
     /\ index \in Index
     /\ key \in Key
-    /\ index \in {spaceIndexes[space][i] : i \in DOMAIN spaceIndexes[space]}
+    /\ SpaceOfIndex(index) = space
     /\ LET tuple == IndexGetTuple(index, key)
            visible_result == FindVisibleTuple(txn, index, key, tuple)
        IN /\ allStmts' = allStmts \cup {nextStmtId}
@@ -682,8 +710,7 @@ Delete(txn, space, index, key) ==
                THEN IF tuple # NULL /\ tuple \in DOMAIN history /\ history[tuple] # NULL
                     THEN \* Track gap for top_story
                          LET top_story == history[tuple]
-                             indexes == spaceIndexes[space]
-                             index_pos == CHOOSE i \in DOMAIN indexes : indexes[i] = index
+                             index_pos == PosInSpace(index)
                          IN /\ gapTrackers' = AddGapTracker(gapTrackers, top_story, index_pos, txn)
                             /\ UNCHANGED <<pointHoles>>
                     ELSE \* tuple = NULL - track point hole
@@ -694,36 +721,161 @@ Delete(txn, space, index, key) ==
                     /\ UNCHANGED <<gapTrackers, pointHoles>>
     /\ UNCHANGED <<storyChains, indexState, tuples, history,
                   nextTxnId, nextStoryId, nextTupleId, nextPSN,
-                  allStories, allTxns, spaceIndexes>>
+                  allStories, allTxns, spaceIndexes, spaceIndexCount>>
+
+\* Helper function: Find the position of the last prepared/committed story in a chain
+\* Returns the position (1-based) of the last prepared/committed story, or 0 if none found
+LastPreparedCommittedPosition(chain) ==
+    IF Len(chain) = 0
+    THEN 0
+    ELSE LET CheckPosition[pos \in 1..Len(chain)] ==
+             LET story == chain[pos]
+             IN IF IsPreparedOrCommittedStory(story)
+                THEN pos  \* Found prepared/committed story
+                ELSE IF pos = 1
+                     THEN 0  \* No prepared/committed story found
+                     ELSE CheckPosition[pos - 1]  \* Check older story
+         IN CheckPosition[Len(chain)]  \* Start from newest
+
+\* Helper function: Move all txn stories to end of prepared block in a chain
+\* Returns new chain with txn stories moved after last prepared/committed story
+MoveTxnStoriesToPreparedBlock(chain, txn_stories) ==
+    LET \* Find stories from this transaction in the chain
+        txn_stories_in_chain == {s \in txn_stories : s \in {chain[i] : i \in DOMAIN chain}}
+    IN IF txn_stories_in_chain = {}
+       THEN chain  \* No stories from this transaction in chain
+       ELSE \* Find position of last prepared/committed story
+            LET last_prep_pos == LastPreparedCommittedPosition(chain)
+                \* Build new chain by iterating through original chain positions
+                \* Collect: [stories before last_prep_pos] ++ [txn stories] ++ [non-txn stories after last_prep_pos]
+                last_prep_pos_after == last_prep_pos + Cardinality(txn_stories_in_chain)
+            IN [i \in 1..Len(chain) |->
+               IF i <= last_prep_pos
+               THEN chain[i]  \* Stories before last_prep_pos
+               ELSE IF i <= last_prep_pos_after
+                    THEN \* Txn story: find (i - last_prep_pos)-th txn story by position
+                        LET pos == CHOOSE p \in (last_prep_pos + 1)..Len(chain) :
+                                     chain[p] \in txn_stories_in_chain /\
+                                     Cardinality({q \in (last_prep_pos + 1)..(p - 1) :
+                                         chain[q] \in txn_stories_in_chain}) = i - last_prep_pos - 1
+                        IN chain[pos]
+                    ELSE \* Non-txn story after last_prep_pos: find (i - last_prep_pos_after)-th non-txn story
+                        LET pos == CHOOSE p \in (last_prep_pos + 1)..Len(chain) :
+                                     chain[p] \notin txn_stories_in_chain /\
+                                     Cardinality({q \in (last_prep_pos + 1)..(p - 1) :
+                                         chain[q] \notin txn_stories_in_chain}) = i - last_prep_pos_after - 1
+                        IN chain[pos]]
+
+StoryChainFindNewTopOnPrepare(chain, txn_stories) ==
+    \* Find the newest in-progress story in chain that is NOT in txn_stories (excluding the top element).
+    IF Len(chain) < 2 THEN NULL
+    ELSE
+        LET start == Len(chain) - 1
+            Check[pos \in Nat] ==
+                IF pos < 1 THEN NULL
+                ELSE LET s == chain[pos] IN
+                    \* Stop as soon as we leave the in-progress suffix.
+                    IF ~IsInProgressStory(s) THEN NULL
+                    ELSE IF s \notin txn_stories THEN s
+                    ELSE Check[pos - 1]
+        IN Check[start]
+
+MoveGapTrackersOnPrepare(gap_trackers_map, story_chains_map, txn_stories) ==
+    LET movedTriples ==
+            {<<top, target, pos>> \in (Story \X Story \X (1..MaxIndexesPerSpace)) :
+                \E idx \in DOMAIN story_chains_map:
+                  \E key \in DOMAIN story_chains_map[idx]:
+                    LET chain == story_chains_map[idx][key]
+                        top0 == chain[Len(chain)]
+                        target0 == StoryChainFindNewTopOnPrepare(chain, txn_stories)
+                    IN /\ Len(chain) > 0
+                       /\ top0 \in txn_stories
+                       /\ target0 # NULL
+                       /\ top = top0 /\ target = target0 /\ pos = PosInSpace(idx)}
+    IN [s \in Story |->
+         [i \in 1..MaxIndexesPerSpace |->
+            IF \E t \in movedTriples: t[1] = s /\ t[3] = i
+            THEN {} \* cleared at source
+            ELSE gap_trackers_map[s][i] \cup
+                 UNION {IF t[2] = s /\ t[3] = i
+                        THEN gap_trackers_map[t[1]][t[3]]
+                        ELSE {} :
+                        t \in movedTriples}]]
+
+\* Helper: rebind physical indexState when PrepareTxn changes the top of a chain.
+\* If top of (idx,key) chain is a txn story and StoryChainFindNewTopOnPrepare returns new_top,
+\* then indexState[idx][key] must point to stories[new_top].tuple.
+RebindIndexStateOnPrepare(index_state_map, story_chains_map, stories_map, txn_stories) ==
+    [idx \in Index |->
+        [key \in Key |->
+            LET chain == story_chains_map[idx][key] IN
+            IF Len(chain) = 0 THEN index_state_map[idx][key]
+            ELSE
+                LET top == chain[Len(chain)]
+                    new_top == IF top \in txn_stories
+                              THEN StoryChainFindNewTopOnPrepare(chain, txn_stories)
+                              ELSE NULL
+                IN IF new_top # NULL THEN stories_map[new_top].tuple
+                ELSE index_state_map[idx][key]]]
+
+\* Action: Prepare transaction
+\* Moves all stories of the transaction to the end of prepared blocks in their chains
+PrepareTxn(txn) ==
+    /\ IsInProgress(txn)
+    /\ LET \* Find all stories created by this transaction
+        txn_stories ==
+            {stmts[txns[txn].stmts[i]].add_story :
+                i \in DOMAIN txns[txn].stmts} \ {NULL}
+        IN \* Update story chains: for each chain, move all txn stories after last prepared/committed story 
+            /\ storyChains' =
+                [index \in DOMAIN storyChains |->
+                    [key \in DOMAIN storyChains[index] |->
+                        MoveTxnStoriesToPreparedBlock(storyChains[index][key], txn_stories)]]
+            /\ stories' =
+                [s \in DOMAIN stories |->
+                    IF s \in txn_stories
+                    THEN [stories[s] EXCEPT !.add_psn = nextPSN]
+                    ELSE stories[s]]
+            /\ gapTrackers' = MoveGapTrackersOnPrepare(gapTrackers, storyChains, txn_stories)
+            /\ indexState' = RebindIndexStateOnPrepare(indexState, storyChains, stories, txn_stories)
+            /\ txns' = [txns EXCEPT ![txn].status = PREPARED,
+                                    ![txn].psn = nextPSN]
+            /\ nextPSN' = nextPSN + 1
+            /\ UNCHANGED <<stmts, pointHoles, tuples, history,
+                        nextTxnId, nextStmtId, nextStoryId, nextTupleId,
+                        allStories, allTxns, allStmts, spaceIndexes, spaceIndexCount,
+                        readTrackers>>
 
 \* Next state relation
 Next ==
     \/ BeginTxn
-    \/ \E txn \in allTxns,
-          space \in Space,
-          keys \in UNION {[1..i -> Key] : i \in 1..MaxIndexesPerSpace},
-          mode \in {"INSERT", "REPLACE"} :
-       /\ IsInProgress(txn)
-       /\ LET tuple == [keys |-> keys]
-             new_tuple_id == nextTupleId
-          IN /\ nextTupleId' = nextTupleId + 1
-             /\ tuples' = [tuples EXCEPT ![new_tuple_id] = tuple]
-             /\ InsertReplace(txn, space, tuple, new_tuple_id, mode)
+    \/ \E txn \in allTxns:
+       \E space \in Space:
+       \E mode \in {"INSERT", "REPLACE"}:
+       \E keys \in [1..spaceIndexCount[space] -> Key]:
+         /\ IsInProgress(txn)
+         /\ LET tuple == [keys |-> keys]
+            IN /\ nextTupleId \in Tuple
+               /\ nextTupleId' = nextTupleId + 1
+               /\ tuples' = [tuples EXCEPT ![nextTupleId] = tuple]
+               /\ InsertReplace(txn, space, tuple, nextTupleId, mode)
     \/ \E txn \in allTxns, index \in Index, key \in Key :
        /\ IsInProgress(txn)
        /\ Get(txn, index, key)
     \/ \E txn \in allTxns, space \in Space, index \in Index, key \in Key :
        /\ IsInProgress(txn)
        /\ Delete(txn, space, index, key)
-    \* TODO: Add other actions when implemented
     \* \/ \E txn \in allTxns : PrepareTxn(txn)
+    \* TODO: Add other actions when implemented
     \* \/ \E txn \in allTxns : CommitTxn(txn)
     \* \/ \E txn \in allTxns : RollbackTxn(txn)
 
 \* Specification
 Spec == Init /\ [][Next]_<<txns, storyChains, stories, stmts,
-                      pointHoles, indexState, tuples, history, nextTxnId, nextStmtId,
-                      nextStoryId, nextTupleId, nextPSN, allStories, allTxns, allStmts>>
+                      gapTrackers, readTrackers,
+                      pointHoles, indexState, tuples, history,
+                      nextTxnId, nextStmtId, nextStoryId, nextTupleId, nextPSN,
+                      allStories, allTxns, allStmts, spaceIndexes, spaceIndexCount>>
 
 THEOREM Spec => []Invariants
 

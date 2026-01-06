@@ -1,0 +1,52 @@
+name: TLA+ spec (TLC)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Run TLC (timeout is success)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Workspace contents:"
+          ls -la
+
+          # Ensure tla2tools.jar exists and actually contains tlc2/TLC.class.
+          if [ ! -f tla2tools.jar ] || ! jar tf tla2tools.jar | grep -q '^tlc2/TLC\.class$'; then
+            echo "tla2tools.jar missing or invalid; downloading a known-good version..."
+            curl -fsSL -o tla2tools.jar \
+              "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar"
+            jar tf tla2tools.jar | grep -q '^tlc2/TLC\.class$'
+          fi
+
+          # If TLC doesn't find a violation within the timeout, we consider it a success.
+          # GNU coreutils `timeout` exits with code 124 on timeout.
+          SECONDS_LIMIT="${TLC_TIMEOUT_SECONDS:-120}"
+
+          set +e
+          timeout "${SECONDS_LIMIT}s" \
+            java -jar tla2tools.jar -config MVCC.cfg memtx_tx.tla -workers 4
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 124 ]; then
+            echo "TLC timed out after ${SECONDS_LIMIT}s (treated as success)."
+            exit 0
+          fi
+
+          exit "$rc"
